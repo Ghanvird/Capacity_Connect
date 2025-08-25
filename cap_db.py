@@ -50,7 +50,7 @@ def init_db(path: str | None = None):
 
 def save_df(name: str, df: pd.DataFrame):
     csv = df.to_csv(index=False)
-    ts  = dt.datetime.utcnow().isoformat()
+    ts = dt.datetime.now(dt.timezone.utc).isoformat()
     with _conn() as cx:
         cx.execute(
             "REPLACE INTO datasets(name,csv,updated_at) VALUES(?,?,?)",
@@ -67,7 +67,7 @@ def load_df(name: str) -> Optional[pd.DataFrame]:
     return pd.read_csv(io.StringIO(row["csv"]))
 
 def save_kv(key: str, obj):
-    ts  = dt.datetime.utcnow().isoformat()
+    ts  = dt.datetime.now(dt.timezone.utc).isoformat()
     js  = json.dumps(obj)
     with _conn() as cx:
         cx.execute("REPLACE INTO kv(key,value,updated_at) VALUES(?,?,?)", (key, js, ts))
