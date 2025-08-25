@@ -2205,64 +2205,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual");  vT = _assemble_voice(sk, "tactical")
     bF = _assemble_bo(sk,   "forecast"); bA = _assemble_bo(sk,   "actual");    bT = _assemble_bo(sk,   "tactical")
 
-    # ---------- Budget AHT/SUT (weekly) overrides from Budget page (Option A) ----------
-    def _budget_aht_sut_overrides(sk: str, which: str) -> Dict[str, float]:
-        """
-        Read Budget-page uploads (weekly AHT/SUT) for the scope_key `sk`.
-        Returns {week_iso: seconds}. `which` in {"voice","bo"}.
-        Accepts tolerant column names and optional volume weighting.
-        """
-        keys_voice = [
-            "budget_voice_aht","budget_aht_voice","budget_aht_sut_voice",
-            "budget_settings_voice","budgeted_aht_voice"
-        ]
-        keys_bo = [
-            "budget_bo_sut","budget_sut_bo","budget_aht_sut_bo",
-            "budget_settings_bo","budgeted_sut_bo"
-        ]
-        df = _first_non_empty_ts(sk, keys_voice if which.lower()=="voice" else keys_bo)
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return {}
-        d = df.copy()
-        L = {str(c).strip().lower(): c for c in d.columns}
-        c_date = L.get("date") or L.get("week") or L.get("start_date")
-        c_time = (L.get("aht_sec") or L.get("aht") or L.get("avg_aht") or
-                  L.get("sut_sec") or L.get("sut") or L.get("avg_sut"))
-        if not c_date or not c_time:
-            return {}
-        d[c_date] = pd.to_datetime(d[c_date], errors="coerce")
-        d = d.dropna(subset=[c_date])
-        d["week"] = (d[c_date] - pd.to_timedelta(d[c_date].dt.weekday, unit="D")).dt.date.astype(str)
-        d[c_time] = pd.to_numeric(d[c_time], errors="coerce").fillna(0.0)
-
-        c_vol = L.get("vol") or L.get("volume") or L.get("calls") or L.get("items") or L.get("txns")
-        if c_vol and c_vol in d.columns:
-            d[c_vol] = pd.to_numeric(d[c_vol], errors="coerce").fillna(0.0)
-            d["_num_"] = d[c_time] * d[c_vol]
-            g = d.groupby("week", as_index=False)[["_num_", c_vol]].sum()
-            g["_wt_"] = np.where(g[c_vol] > 0, g["_num_"] / g[c_vol], np.nan)
-            m = g.set_index("week")["_wt_"]
-        else:
-            m = d.groupby("week", as_index=False)[c_time].mean().set_index("week")[c_time]
-
-        return {k: float(v) for k, v in m.dropna().to_dict().items() if v > 0}
-
-    def _apply_weekly_override(df: pd.DataFrame, week_map: Dict[str, float], time_col="aht_sec"):
-        """Apply a {week: seconds} override to a daily DF with a 'date' column."""
-        if not isinstance(df, pd.DataFrame) or df.empty or not week_map:
-            return df
-        x = df.copy()
-        dts = pd.to_datetime(x["date"], errors="coerce")
-        x["week"] = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date.astype(str)
-        x["_ovr"] = x["week"].map(week_map)
-        if time_col not in x.columns:
-            x[time_col] = 0.0
-        # prefer weekly override if present and positive
-        base = pd.to_numeric(x[time_col], errors="coerce").fillna(0.0)
-        x[time_col] = np.where(pd.notna(x["_ovr"]) & (x["_ovr"] > 0), x["_ovr"], base)
-        return x.drop(columns=["week","_ovr"])
-    # ---------------------------------------------------------------------------
-
     # Fallback for requirements if actuals missing
     use_voice_for_req = vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF
     use_bo_for_req    = bA if isinstance(bA, pd.DataFrame) and not bA.empty else bF
@@ -2277,7 +2219,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     bA_w = bA_w.set_index("week") if not bA_w.empty else pd.DataFrame()
     bT_w = bT_w.set_index("week") if not bT_w.empty else pd.DataFrame()
 
-    # Helpers for column picking / safe gets
+    # Helpers
     def _pick(df, names):
         if not isinstance(df, pd.DataFrame) or df.empty: return None
         for n in names:
@@ -2301,7 +2243,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                 pass
         return default
 
-    # choose voice columns per frame (lets us mix forecast/actual safely)
+    # choose columns
     v_vol_col_F = _pick(vF_w, ["vol","calls","volume"]) or "vol"
     v_vol_col_A = _pick(vA_w, ["vol","calls","volume"]) or v_vol_col_F
     v_vol_col_T = _pick(vT_w, ["vol","calls","volume"]) or v_vol_col_F
@@ -2317,8 +2259,8 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     fw = pd.DataFrame({"metric": fw_rows})
     for w in week_ids: fw[w] = 0.0
 
-    # Track weekly AHT/SUT used later
-    wk_aht_sut_actual, wk_aht_sut_forecast = {}, {}
+    # Track weekly AHT/SUT
+    wk_aht_sut_actual, wk_aht_sut_forecast, wk_aht_sut_budgeted = {}, {}, {}
 
     # For SL – count intervals if present, else fallback to 24x7
     ivl_sec = 1800  # 30-minute intervals
@@ -2331,19 +2273,96 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             weekly_voice_intervals = tmp.groupby("week", as_index=False)["interval_start"].count().set_index("week")["interval_start"].to_dict()
     except Exception:
         weekly_voice_intervals = {}
-    intervals_per_week_default = 7 * (24 * 3600 // ivl_sec)  # 336 for 24x7
+    intervals_per_week_default = 7 * (24 * 3600 // ivl_sec)
 
     # demand used for SL
     weekly_demand_voice, weekly_demand_bo = {}, {}
 
-    # Settings-page forecast overrides (already existing)
+    # Settings-upload overrides (scope upload)
     voice_ovr = _settings_volume_aht_overrides(sk, "voice")
     bo_ovr    = _settings_volume_aht_overrides(sk, "bo")
 
-    # NEW: Budget weekly overrides dicts (Option A)
-    budget_voice_w = _budget_aht_sut_overrides(sk, "voice")  # {week: aht_sec}
-    budget_bo_w    = _budget_aht_sut_overrides(sk, "bo")     # {week: sut_sec}
+    # -------- Budget AHT/SUT loader (Budget upload → weekly dict) -------------
+    def _load_budget_timeseries(which: str) -> Dict[str, float]:
+        which = (which or "").strip().lower()
+        # tolerant key search (works for single-file HC + AHT/SUT and variants)
+        keys_common = [
+            "budget_aht_sut","budget_times","budget_settings","budget","budget_upload",
+            "budget_page_upload","budget_plan","budget_plan_upload"
+        ]
+        keys_voice = [
+            "budget_voice_aht","budget_aht_voice","budget_aht_sut_voice",
+            "budget_settings_voice","budgeted_aht_voice","budget_voice","voice_budget",
+            *keys_common
+        ]
+        keys_bo = [
+            "budget_bo_sut","budget_sut_bo","budget_aht_sut_bo",
+            "budget_settings_bo","budgeted_sut_bo","budget_bo","backoffice_budget",
+            "budget_nonvoice","budget_non_voice",
+            *keys_common
+        ]
+        df = _first_non_empty_ts(sk, keys_voice if which == "voice" else keys_bo)
+        if not (isinstance(df, pd.DataFrame) and not df.empty):
+            # sometimes HC + times live in the HC dataset name
+            df = _first_non_empty_ts(sk, ["budget_headcount","budget_hc","headcount_budget","hc_budget","budget"])
+        if not (isinstance(df, pd.DataFrame) and not df.empty):
+            return {}
 
+        d = df.copy()
+        L = {str(c).strip().lower(): c for c in d.columns}
+
+        # Wide weekly form
+        wide_weeks = [w for w in week_ids if w in d.columns]
+        if wide_weeks:
+            met = L.get("metric")
+            row = d
+            if met:
+                pat = "aht" if which == "voice" else "sut"
+                row = d[d[met].astype(str).str.lower().str.contains(pat)]
+            if not row.empty:
+                vals = pd.to_numeric(row[wide_weeks].iloc[0], errors="coerce")
+                return {w: float(v) for w, v in vals.items() if pd.notna(v) and v > 0}
+
+        # Long form (date/week + value)
+        c_date = L.get("date") or L.get("week") or L.get("start_date")
+        if not c_date:
+            return {}
+        d[c_date] = pd.to_datetime(d[c_date], errors="coerce")
+        d = d.dropna(subset=[c_date])
+        d["week"] = (d[c_date] - pd.to_timedelta(d[c_date].dt.weekday, unit="D")).dt.date.astype(str)
+
+        # pick value column
+        cands_voice = ["aht_sec","aht","avg_aht","voice_aht_sec","voice_aht","budget_aht","budget_aht_sec","aht_sut","aht_sut_sec"]
+        cands_bo    = ["sut_sec","sut","avg_sut","bo_sut_sec","bo_sut","budget_sut","budget_sut_sec","aht_sut","aht_sut_sec"]
+        c_val = next((L[c] for c in (cands_voice if which == "voice" else cands_bo) if L.get(c) in d.columns), None)
+        if not c_val:
+            return {}
+        d[c_val] = pd.to_numeric(d[c_val], errors="coerce").fillna(0.0)
+
+        # optional channel column filter when both are in one file
+        c_ch = L.get("channel") or L.get("lob") or L.get("type")
+        if c_ch and c_ch in d.columns:
+            want = {"voice"} if which == "voice" else {"bo","back office","back-office","non-voice"}
+            dd = d[d[c_ch].astype(str).str.strip().str.lower().isin(want)]
+            if not dd.empty:
+                d = dd
+
+        # optional volume weighting if present
+        c_vol = L.get("vol") or L.get("volume") or L.get("calls") or L.get("items") or L.get("txns")
+        if c_vol and c_vol in d.columns:
+            d[c_vol] = pd.to_numeric(d[c_vol], errors="coerce").fillna(0.0)
+            d["_num_"] = d[c_val] * d[c_vol]
+            g = d.groupby("week", as_index=False)[["_num_", c_vol]].sum()
+            g["_wt_"] = np.where(g[c_vol] > 0, g["_num_"] / g[c_vol], np.nan)
+            s = g.set_index("week")["_wt_"]
+        else:
+            s = d.groupby("week", as_index=False)[c_val].mean().set_index("week")[c_val]
+        return {k: float(v) for k, v in s.dropna().to_dict().items() if v > 0}
+
+    budget_voice_w = _load_budget_timeseries("voice")   # weekly voice AHT from Budget upload (sec)
+    budget_bo_w    = _load_budget_timeseries("bo")      # weekly BO SUT from Budget upload (sec)
+
+    # ---------------- per-week loop ----------------
     for w in week_ids:
         f_voice = _get(vF_w, w, v_vol_col_F, 0.0) if v_vol_col_F else 0.0
         f_bo    = _get(bF_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
@@ -2352,12 +2371,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         t_voice = _get(vT_w, w, v_vol_col_T, 0.0) if v_vol_col_T else 0.0
         t_bo    = _get(bT_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
 
-        # settings overrides for volume (and aht/sut for forecast calc)
+        # settings-upload volume overrides
         if w in voice_ovr["vol_w"]:
             f_voice = voice_ovr["vol_w"][w]
         if w in bo_ovr["vol_w"]:
             f_bo = bo_ovr["vol_w"][w]
 
+        # Use overridden AHT/SUT (settings upload) in the forecast weighting when available
         ovr_aht_voice = voice_ovr["aht_or_sut_w"].get(w, None)
         ovr_sut_bo    = bo_ovr["aht_or_sut_w"].get(w, None)
 
@@ -2371,64 +2391,55 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         if "Actual Volume" in fw_rows:
             fw.loc[fw["metric"]=="Actual Volume", w] = a_voice + a_bo
 
-        # Weighted Actual AHT/SUT (voice+bo)
+        # ---- Actual AHT/SUT (weighted by actual vol)
         a_num = a_den = 0.0
         if v_aht_col_A: a_num += _get(vA_w, w, v_aht_col_A, 0.0) * _get(vA_w, w, v_vol_col_A, 0.0); a_den += _get(vA_w, w, v_vol_col_A, 0.0)
         if b_sut_col_A: a_num += _get(bA_w, w, b_sut_col_A, 0.0) * _get(bA_w, w, b_itm_col,   0.0); a_den += _get(bA_w, w, b_itm_col,   0.0)
         actual_aht_sut = (a_num / a_den) if a_den > 0 else 0.0
-        actual_aht_sut = _first_positive(actual_aht_sut, s_target_aht, default=s_target_aht)  # reject 0
+        actual_aht_sut = _first_positive(actual_aht_sut, s_target_aht, default=s_target_aht)
         wk_aht_sut_actual[w] = actual_aht_sut
         if "Actual AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Actual AHT/SUT", w] = actual_aht_sut
 
-        # --- Weighted Forecast AHT/SUT (override-aware) ---
+        # ---- Forecast AHT/SUT (override-aware, volume-weighted)
         f_num = f_den = 0.0
-        # voice contribution
         if ovr_aht_voice is not None and f_voice > 0:
-            f_num += ovr_aht_voice * f_voice
-            f_den += f_voice
+            f_num += ovr_aht_voice * f_voice; f_den += f_voice
         elif v_aht_col_F:
             f_num += _get(vF_w, w, v_aht_col_F, 0.0) * _get(vF_w, w, v_vol_col_F, 0.0)
             f_den += _get(vF_w, w, v_vol_col_F, 0.0)
-        # back-office contribution
         if ovr_sut_bo is not None and f_bo > 0:
-            f_num += ovr_sut_bo * f_bo
-            f_den += f_bo
+            f_num += ovr_sut_bo * f_bo; f_den += f_bo
         elif b_sut_col_F:
-            f_num += _get(bF_w, w, b_sut_col_F, 0.0) * _get(bF_w, w, b_itm_col,   0.0)
-            f_den += _get(bF_w, w, b_itm_col,   0.0)
-
+            f_num += _get(bF_w, w, b_sut_col_F, 0.0) * _get(bF_w, w, b_itm_col, 0.0)
+            f_den += _get(bF_w, w, b_itm_col, 0.0)
         forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
         forecast_aht_sut = _first_positive(forecast_aht_sut, s_target_aht, default=s_target_aht)
         wk_aht_sut_forecast[w] = forecast_aht_sut
-        denom = float(f_voice + f_bo)
-
-        # --- Budgeted AHT/SUT row (Option A: weekly Budget upload → weighted by current volumes) ---
-        if "Budgeted AHT/SUT" in fw_rows:
-            bud_voice = budget_voice_w.get(w, None)
-            bud_bo    = budget_bo_w.get(w, None)
-            voice_budget = bud_voice if (bud_voice is not None and bud_voice > 0) else s_budget_aht
-            bo_budget    = bud_bo    if (bud_bo    is not None and bud_bo    > 0) else s_budget_sut
-            if denom > 0:
-                bud_val = ((f_voice * voice_budget) + (f_bo * bo_budget)) / denom
-            else:
-                bud_val = _first_positive(voice_budget, bo_budget, default=s_budget_aht)
-            fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = float(bud_val)
-
-        if "Target AHT/SUT" in fw_rows:
-            if denom > 0:
-                tgt_val = ((f_voice * s_target_aht) + (f_bo * s_target_sut)) / denom
-            else:
-                tgt_val = _first_positive(s_target_aht, s_target_sut, default=s_target_aht)
-            fw.loc[fw["metric"] == "Target AHT/SUT", w] = float(tgt_val)
         if "Forecast AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Forecast AHT/SUT", w] = forecast_aht_sut
 
-        # also ensure the "Forecast" row uses the possibly overridden volumes
+        # ---- Budgeted AHT/SUT (budget-upload-aware, volume-weighted)
+        b_num = b_den = 0.0
+        bud_aht_v = budget_voice_w.get(w, None)
+        bud_sut_b = budget_bo_w.get(w, None)
+        # voice side
+        if f_voice > 0:
+            b_num += (bud_aht_v if bud_aht_v is not None else s_budget_aht) * f_voice
+            b_den += f_voice
+        # back-office side
+        if f_bo > 0:
+            b_num += (bud_sut_b if bud_sut_b is not None else s_budget_sut) * f_bo
+            b_den += f_bo
+        budget_aht_sut = (b_num / b_den) if b_den > 0 else _first_positive(s_budget_aht, s_budget_sut, default=s_budget_aht)
+        wk_aht_sut_budgeted[w] = budget_aht_sut
+        if "Budgeted AHT/SUT" in fw_rows:
+            fw.loc[fw["metric"]=="Budgeted AHT/SUT", w] = float(budget_aht_sut)
+
+        # ensure "Forecast" row reflects any volume overrides
         if "Forecast" in fw_rows:
             fw.loc[fw["metric"]=="Forecast", w] = f_voice + f_bo
 
-        # demand used for SL should see the overrides too
         weekly_demand_voice[w] = f_voice if f_voice > 0 else (a_voice if a_voice > 0 else t_voice)
         weekly_demand_bo[w]    = f_bo    if f_bo    > 0 else (a_bo    if a_bo    > 0 else t_bo)
 
@@ -2464,19 +2475,32 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         occ = 85
     occ_frac = min(0.99, max(0.01, float(occ)/100.0))
 
-    # Requirements (daily→weekly sums)
+    # -------- Requirements (daily→weekly sums), with BUDGET weekly AHT/SUT ----
+    def _apply_week_map(ts_df, week_map, col="aht_sec"):
+        if not isinstance(ts_df, pd.DataFrame) or ts_df.empty or "date" not in ts_df.columns:
+            return ts_df
+        d = ts_df.copy()
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d = d.dropna(subset=["date"])
+        d["_week"] = (d["date"] - pd.to_timedelta(d["date"].dt.weekday, unit="D")).dt.date.astype(str)
+        # fill with map; keep existing if map missing
+        d[col] = d["_week"].map(week_map).fillna(d.get(col))
+        return d.drop(columns=["_week"])
+
     req_daily_actual   = required_fte_daily(use_voice_for_req, use_bo_for_req, pd.DataFrame(), settings)
     req_daily_forecast = required_fte_daily(vF, bF, pd.DataFrame(), settings)
+
+    # Build weekly maps (fallback to scalar budgets if a week missing)
+    week_map_voice = {w: float(budget_voice_w.get(w, s_budget_aht)) for w in week_ids}
+    week_map_bo    = {w: float(budget_bo_w.get(w,    s_budget_sut)) for w in week_ids}
+
+    vB = vF.copy(); bB = bF.copy()
+    if isinstance(vB, pd.DataFrame) and not vB.empty:
+        vB = _apply_week_map(vB, week_map_voice, col="aht_sec")
+    if isinstance(bB, pd.DataFrame) and not bB.empty:
+        bB = _apply_week_map(bB, week_map_bo, col="aht_sec")  # BO uses 'aht_sec' slot for SUT seconds
+
     req_daily_tactical = required_fte_daily(vT, bT, pd.DataFrame(), settings) if (isinstance(vT, pd.DataFrame) and not vT.empty) or (isinstance(bT, pd.DataFrame) and not bT.empty) else pd.DataFrame()
-
-    # Budgeted path (Option A): start with static, then overlay weekly budget uploads
-    vB = vF.copy() if isinstance(vF, pd.DataFrame) else vF
-    bB = bF.copy() if isinstance(bF, pd.DataFrame) else bF
-    if isinstance(vB, pd.DataFrame) and not vB.empty: vB["aht_sec"] = float(s_budget_aht)
-    if isinstance(bB, pd.DataFrame) and not bB.empty: bB["aht_sec"] = float(s_budget_sut)
-    vB = _apply_weekly_override(vB, budget_voice_w, "aht_sec") if isinstance(vB, pd.DataFrame) else vB
-    bB = _apply_weekly_override(bB, budget_bo_w,    "aht_sec") if isinstance(bB, pd.DataFrame) else bB
-
     req_daily_budgeted = required_fte_daily(vB, bB, pd.DataFrame(), settings)
 
     def _daily_to_weekly(df):
@@ -2498,55 +2522,38 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     fw_saved = _load_or_blank(f"plan_{pid}_fw", spec["fw"], week_ids)
 
     def _merge_fw_user_overrides(fw_calc: pd.DataFrame, fw_user: pd.DataFrame, week_ids: list) -> pd.DataFrame:
-        """
-        Overlay user-entered FW rows onto the computed FW rows.
-        We override only Budgeted/Target (aka Planned) AHT/SUT rows (with tolerant matching).
-        """
         if not isinstance(fw_calc, pd.DataFrame) or fw_calc.empty:
             return fw_user if isinstance(fw_user, pd.DataFrame) else pd.DataFrame()
-
         calc = fw_calc.copy()
         if not isinstance(fw_user, pd.DataFrame) or fw_user.empty:
             return calc
-
-        c = calc.set_index("metric")
-        u = fw_user.set_index("metric")
-
-        # make week columns numeric for safe coercion
+        c = calc.set_index("metric"); u = fw_user.set_index("metric")
         for w in week_ids:
             if w in c.columns: c[w] = pd.to_numeric(c[w], errors="coerce")
             if w in u.columns: u[w] = pd.to_numeric(u[w], errors="coerce")
-
         def _find_row(idx_like, *alts):
             low = {str(k).strip().lower(): k for k in idx_like}
             for a in alts:
                 k = str(a).strip().lower()
                 if k in low: return low[k]
-            # fallback: substring contains
             for key, orig in low.items():
                 for a in alts:
                     if str(a).strip().lower() in key:
                         return orig
             return None
-
         budget_label_calc = _find_row(c.index, "Budgeted AHT/SUT", "Budget AHT/SUT", "Budget AHT", "Budget SUT")
         target_label_calc = _find_row(c.index, "Target AHT/SUT",   "Planned AHT/SUT", "Planned AHT", "Planned SUT", "Target AHT", "Target SUT")
-
         budget_label_user = _find_row(u.index, "Budgeted AHT/SUT", "Budget AHT/SUT", "Budget AHT", "Budget SUT")
         target_label_user = _find_row(u.index, "Target AHT/SUT",   "Planned AHT/SUT", "Planned AHT", "Planned SUT", "Target AHT", "Target SUT")
-
         def _apply(canon_label, user_label):
-            if not canon_label or not user_label:
-                return
+            if not canon_label or not user_label: return
             for w in week_ids:
                 if w in u.columns and w in c.columns:
                     val = u.at[user_label, w]
                     if pd.notna(val):
                         c.at[canon_label, w] = float(val)
-
         _apply(budget_label_calc, budget_label_user)
         _apply(target_label_calc, target_label_user)
-
         return c.reset_index()
 
     fw_to_use = _merge_fw_user_overrides(fw, fw_saved, week_ids)
@@ -2574,7 +2581,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         r = roster_df.copy()
         if isinstance(r, pd.DataFrame) and not r.empty:
             L = {str(c).strip().lower(): c for c in r.columns}
-
             brid_c = L.get("brid") or L.get("employee id") or L.get("employee_id")
             role_c = L.get("role") or L.get("position group") or L.get("position description")
             ba_c   = L.get("business area") or L.get("ba")
@@ -2582,35 +2588,29 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             lob_c  = L.get("lob") or L.get("channel") or L.get("program")
             cur_c  = L.get("current status") or L.get("current_status") or L.get("status")
             work_c = L.get("work status")   or L.get("work_status")
-
             if brid_c and role_c:
                 def _eq(col, val):
                     if not col or col not in r.columns or val in (None, ""):
                         return pd.Series(True, index=r.index)
                     return r[col].astype(str).str.strip().str.lower().eq(str(val).strip().lower())
-
                 r = r[_eq(ba_c,  p.get("vertical")) &
                       _eq(sba_c, p.get("sub_ba")) &
                       _eq(lob_c, ch_first)]
-
                 cur  = r[cur_c].astype(str)  if cur_c  in r.columns else pd.Series("", index=r.index)
                 work = r[work_c].astype(str) if work_c in r.columns else pd.Series("", index=r.index)
                 eff  = cur.where(cur.str.strip()!="", work).str.strip().str.lower()
                 is_prod = eff.eq("production")
-
                 role = r[role_c].astype(str).str.strip().str.lower()
                 is_agent = role.str.contains(r"\bagent\b", regex=True)
                 is_sme   = role.str.contains(r"\bsme\b",   regex=True)
-
                 brid = r[brid_c].astype(str).str.strip()
-
                 actual_agent_hc = int(brid[is_prod & is_agent].nunique())
                 sme_billable_hc = int(brid[is_prod & is_sme].nunique())
     except Exception:
         pass
 
     # --- Headcount (Budget/Planned from Budget upload) ---
-    budget_df = _first_non_empty_ts(sk, ["budget_headcount","budget_hc","headcount_budget","hc_budget"])
+    budget_df = _first_non_empty_ts(sk, ["budget_headcount","budget_hc","headcount_budget","hc_budget","budget"])
     budget_w  = _weekly_reduce(budget_df, value_candidates=("hc","headcount","value","count"), how="sum")
     for w in week_ids:
         b = float(budget_w.get(w, 0.0))
@@ -2627,7 +2627,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                                 value_candidates=("hc","headcount","value","count"), how="sum")
     att_pct_w  = _weekly_reduce(_first_non_empty_ts(sk, ["attrition_pct","attrition_percent","attrition%","attrition_rate"]),
                                 value_candidates=("pct","percent","value"), how="mean")
-
     for w in week_ids:
         plan_hc = float(att_plan_w.get(w, 0.0))
         act_hc  = float(att_act_w.get(w, 0.0))
@@ -2641,17 +2640,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
 
     # -------- Shrinkage (RAW → plan) -----------------------------------------
     ooo_hours_w, io_hours_w, base_hours_w = {}, {}, {}
-
     def _week_key(s):
         ds = pd.to_datetime(s, errors="coerce")
         if isinstance(ds, pd.Series):
             monday = ds.dt.normalize() - pd.to_timedelta(ds.dt.weekday, unit="D")
             return monday.dt.date.astype(str)
         else:
-            ds = pd.DatetimeIndex(ds)
+            ds = pd.DatetimeIndex(s)
             monday = ds.normalize() - pd.to_timedelta(ds.weekday, unit="D")
             return pd.Index(monday.date.astype(str))
-
     def _agg_weekly(date_idx, ooo_series, ino_series, base_series):
         wk = _week_key(date_idx)
         g = pd.DataFrame({"week": wk, "ooo": ooo_series, "ino": ino_series, "base": base_series}) \
@@ -2662,13 +2659,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             io_hours_w[k]   = io_hours_w.get(k, 0.0)   + float(r["ino"])
             base_hours_w[k] = base_hours_w.get(k, 0.0) + float(r["base"])
 
-    # ---- VOICE (this plan channel only) ----
+    # ---- VOICE shrinkage (this plan channel only) ----
     if ch_first.lower() == "voice":
         try:
             vraw = load_df("shrinkage_raw_voice")
         except Exception:
             vraw = None
-
         if isinstance(vraw, pd.DataFrame) and not vraw.empty:
             v = vraw.copy()
             L = {str(c).strip().lower(): c for c in v.columns}
@@ -2679,13 +2675,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             c_sba  = L.get("sub business area") or L.get("sub_ba")
             c_ch   = L.get("channel")
             c_loc  = L.get("country") or L.get("location") or L.get("site") or L.get("city")
-
             mask = pd.Series(True, index=v.index)
             if c_ba  and p.get("vertical"): mask &= v[c_ba ].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
             if c_sba and p.get("sub_ba"):  mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
             if c_ch:                        mask &= v[c_ch ].astype(str).str.strip().str.lower().eq("voice")
-
-            # tolerant location filter
             if c_loc and loc_first:
                 loc_series = v[c_loc].astype(str).str.strip()
                 loc_l = loc_series.str.lower()
@@ -2694,27 +2687,22 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                 has_real_locations = loc_l.ne("").any() and loc_l.ne("all").any()
                 if has_target and has_real_locations:
                     mask &= loc_l.eq(target)
-
             v = v.loc[mask]
-
             if c_date and c_state and c_hours and not v.empty:
                 pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
-
                 def col(name): return pv[name] if name in pv.columns else 0.0
-                base = col("SC_INCLUDED_TIME")  # paid/included hours
+                base = col("SC_INCLUDED_TIME")
                 ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
                 ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
-
                 idx_dates = pd.to_datetime(pv.index, errors="coerce")
                 _agg_weekly(idx_dates, ooo, ino, base)
 
-    # ---- BACK OFFICE (this plan channel only) ----
+    # ---- BACK OFFICE shrinkage (this plan channel only) ----
     if ch_first.lower() in ("back office", "bo"):
         try:
             braw = load_df("shrinkage_raw_backoffice")
         except Exception:
             braw = None
-
         if isinstance(braw, pd.DataFrame) and not braw.empty:
             b = braw.copy()
             L = {str(c).strip().lower(): c for c in b.columns}
@@ -2724,12 +2712,9 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             c_ba   = L.get("journey") or L.get("business area") or L.get("ba")
             c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba")
             c_brid = L.get("brid") or L.get("employee id") or L.get("employee_id")
-
             mask = pd.Series(True, index=b.index)
             if c_ba  and p.get("vertical"): mask &= b[c_ba ].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
             if c_sba and p.get("sub_ba"):  mask &= b[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-
-            # Location via roster mapping (BRID → Country/Location)
             if loc_first and c_brid and isinstance(roster_df, pd.DataFrame) and not roster_df.empty:
                 RL = {str(c).strip().lower(): c for c in roster_df.columns}
                 rc_brid = RL.get("brid") or RL.get("employee id") or RL.get("employee_id")
@@ -2741,15 +2726,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                     mp = dict(zip(m[rc_brid], m[rc_loc]))
                     b["_loc_"] = b[c_brid].astype(str).str.strip().map(mp)
                     mask &= b["_loc_"].eq(loc_first.strip().lower())
-
             b = b.loc[mask]
-
             if c_date and c_act and c_sec and not b.empty:
                 d = b[[c_date, c_act, c_sec]].copy()
                 d[c_act] = d[c_act].astype(str).str.strip().str.lower()
                 d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
-                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date  # normalize to date
-
+                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
                 def has(s): return d[c_act].str.contains(s, na=False)
                 sec_div = d.loc[has("divert"), c_sec].groupby(d[c_date]).sum()
                 sec_dow = d.loc[has("down"),   c_sec].groupby(d[c_date]).sum()
@@ -2758,29 +2740,20 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                 sec_ot  = d.loc[has("overtime") | d[c_act].eq("ot"), c_sec].groupby(d[c_date]).sum()
                 sec_lend= d.loc[has("lend"),            c_sec].groupby(d[c_date]).sum()
                 sec_borr= d.loc[has("borrow"),          c_sec].groupby(d[c_date]).sum()
-
-                idx = pd.to_datetime(pd.Index(
-                    set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) |
-                    set(sec_fx.index)  | set(sec_ot.index)  | set(sec_lend.index) | set(sec_borr.index)
-                ), errors="coerce").sort_values()
-
+                idx = pd.to_datetime(pd.Index(set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index)  | set(sec_ot.index)  | set(sec_lend.index) | set(sec_borr.index)), errors="coerce").sort_values()
                 def get(s): return s.reindex(idx, fill_value=0.0)
                 num_sec = get(sec_div) + get(sec_dow)
                 den_sec = (get(sec_sc) + get(sec_fx) + get(sec_ot) - get(sec_lend) + get(sec_borr)).clip(lower=0)
-
-                # BO raw: all shrinkage treated as in-office in this dataset
                 ooo = (0.0 * den_sec).astype(float) / 3600.0
                 ino = num_sec.astype(float)         / 3600.0
                 base= den_sec.astype(float)         / 3600.0
-
                 _agg_weekly(idx, ooo, ino, base)
 
-    # ---- Write weekly values into the Shrinkage grid for THIS plan only ----------
+    # ---- Write weekly values into Shrinkage grid ----------
     for w in week_ids:
         if w not in shr.columns:
             shr[w] = np.nan
         shr[w] = pd.to_numeric(shr[w], errors="coerce").astype("float64")
-
     for w in week_ids:
         base = float(base_hours_w.get(w, 0.0))
         ooo  = float(ooo_hours_w.get(w, 0.0))
@@ -2844,7 +2817,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     att_act   = _row_as_dict(att, "Actual Attrition HC (#)")
     nh_act    = _row_as_dict(nh,  "Actual New Hire HC (#)") or _row_as_dict(nh, "Planned New Hire HC (#)")
 
-    # weekly iterative: prev + NH - Attrition (start from Actual or Planned)
     projected_supply = {}
     prev = None
     for w in week_ids:
@@ -2867,16 +2839,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         last = (A**N)/math.factorial(N) * (N/(N-A))
         p0 = 1.0 / (s + last)
         return last * p0
-
     def _erlang_sl(calls_per_ivl: float, aht_sec: float, agents: float, asa_sec: int, ivl_sec: int) -> float:
         if aht_sec <= 0 or ivl_sec <= 0 or agents <= 0 or calls_per_ivl <= 0:
             return 0.0
         A = (calls_per_ivl * aht_sec) / ivl_sec
         pw = _erlang_c(A, int(math.floor(agents)))
         return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (asa_sec / max(1.0, aht_sec)))))
-
     def _erlang_calls_capacity(agents: float, aht_sec: float, asa_sec: int, ivl_sec: int, target_pct: float) -> float:
-        """Max calls (or items) per interval meeting target SL via binary search."""
         if agents <= 0 or aht_sec <= 0 or ivl_sec <= 0:
             return 0.0
         target = float(target_pct)/100.0
@@ -2884,8 +2853,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         def sl_for(x): return _erlang_sl(x, aht_sec, agents, asa_sec, ivl_sec)
         lo = 0
         while sl_for(hi) >= target and hi < 10_000_000:
-            lo = hi
-            hi *= 2
+            lo = hi; hi *= 2
         while lo < hi:
             mid = (lo + hi + 1) // 2
             if sl_for(mid) >= target:
@@ -2894,12 +2862,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                 hi = mid - 1
         return float(lo)
 
-    # --- Handling capacity (weekly) ---
     handling_capacity = {}
     for w in week_ids:
         agents_eff_raw = projected_supply.get(w, 0.0) * occ_frac
-        agents_eff = max(1.0, float(agents_eff_raw))  # guard: Erlang needs >=1 agent
-
+        agents_eff = max(1.0, float(agents_eff_raw))
         if ch_first.lower() == "voice":
             aht = _first_positive(wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_aht, default=s_target_aht)
             aht = max(1.0, float(aht))
@@ -2913,7 +2879,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             items_per_ivl = _erlang_calls_capacity(agents_eff, sut, sl_seconds, ivl_sec, sl_target_pct)
             handling_capacity[w] = items_per_ivl * intervals_per_week_default
 
-    # --- Projected Service Level (voice + non-voice) ---
     proj_sl = {}
     for w in week_ids:
         ch_l = ch_first.lower()
@@ -2926,11 +2891,9 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             weekly_load = float(weekly_demand_bo.get(w, 0.0))
             aht_sut = _first_positive(wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_sut, default=s_target_sut)
             intervals = intervals_per_week_default
-
         if weekly_load <= 0:
             proj_sl[w] = 0.0
             continue
-
         calls_per_ivl = weekly_load / float(max(1, intervals))
         agents_eff_raw = projected_supply.get(w, 0.0) * occ_frac
         agents_eff = max(1.0, float(agents_eff_raw))
@@ -3034,3 +2997,5 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         bulk_df.to_dict("records"),
         notes_df.to_dict("records"),
     )
+
+
