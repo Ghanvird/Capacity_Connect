@@ -2277,7 +2277,9 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
 
     # demand used for SL
     weekly_demand_voice, weekly_demand_bo = {}, {}
-
+    # Build settings overrides (if any)
+    voice_ovr = _settings_volume_aht_overrides(sk, "voice")
+    bo_ovr    = _settings_volume_aht_overrides(sk, "bo")
     for w in week_ids:
         f_voice = _get(vF_w, w, v_vol_col_F, 0.0) if v_vol_col_F else 0.0
         f_bo    = _get(bF_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
@@ -2336,6 +2338,24 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
         forecast_aht_sut = _first_positive(forecast_aht_sut, s_target_aht, default=s_target_aht)
         wk_aht_sut_forecast[w] = forecast_aht_sut
+        denom = float(f_voice + f_bo)
+
+        # if no forecast volume at all this week, fall back to a sensible scalar
+        if "Budgeted AHT/SUT" in fw_rows:
+            if denom > 0:
+                bud_val = ((f_voice * s_budget_aht) + (f_bo * s_budget_sut)) / denom
+            else:
+                # fallback: prefer voice budget AHT, else BO budget SUT
+                bud_val = _first_positive(s_budget_aht, s_budget_sut, default=s_budget_aht)
+            fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = float(bud_val)
+
+        if "Target AHT/SUT" in fw_rows:
+            if denom > 0:
+                tgt_val = ((f_voice * s_target_aht) + (f_bo * s_target_sut)) / denom
+            else:
+                # fallback: prefer voice target AHT, else BO target SUT
+                tgt_val = _first_positive(s_target_aht, s_target_sut, default=s_target_aht)
+            fw.loc[fw["metric"] == "Target AHT/SUT", w] = float(tgt_val)
         if "Forecast AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Forecast AHT/SUT", w] = forecast_aht_sut
         
@@ -2944,6 +2964,3 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         bulk_df.to_dict("records"),
         notes_df.to_dict("records"),
     )
-
-
-
