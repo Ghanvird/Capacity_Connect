@@ -34,6 +34,66 @@ pd.set_option('future.no_silent_downcasting', True)
 
 CHANNEL_DEFAULTS = ["Voice", "Back Office", "Outbound", "Blended", "Chat", "MessageUs"]
 # ──────────────────────────────────────────────────────────────────────────────
+def _settings_volume_aht_overrides(sk, which: str):
+    """
+    Read 'Settings' uploads where AHT/SUT is uploaded together with volume.
+    Returns dicts:
+      - vol_w: week -> total volume/items
+      - aht_w (voice) or sut_w (bo): week -> weighted AHT/SUT
+    `which` is 'voice' or 'bo'.
+    """
+    # Try a handful of tolerant keys; keep/add keys that match your storage
+    keys_voice = [
+        "settings_voice_volume_aht", "voice_settings_upload",
+        "settings_volume_aht_voice", "voice_volume_aht", "voice_forecast_settings"
+    ]
+    keys_bo = [
+        "settings_bo_volume_sut", "settings_backoffice_volume_sut",
+        "bo_settings_upload", "backoffice_volume_sut", "bo_forecast_settings"
+    ]
+    df = _first_non_empty_ts(sk, keys_voice if which.lower()=="voice" else keys_bo)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"vol_w": {}, "aht_or_sut_w": {}}
+
+    d = df.copy()
+    # Column detection
+    L = {str(c).strip().lower(): c for c in d.columns}
+    c_date = L.get("date") or L.get("week") or L.get("start_date")
+    c_vol  = L.get("vol") or L.get("volume") or L.get("calls") or L.get("items") or L.get("txns") or L.get("transactions")
+    if which.lower()=="voice":
+        c_time = L.get("aht_sec") or L.get("aht") or L.get("avg_aht")
+    else:
+        c_time = L.get("sut_sec") or L.get("sut") or L.get("avg_sut") or L.get("aht_sec")  # tolerate 'aht_sec' for BO
+
+    if not c_date or not c_vol or not c_time:
+        return {"vol_w": {}, "aht_or_sut_w": {}}
+
+    # Normalize & weekly group
+    d[c_date] = pd.to_datetime(d[c_date], errors="coerce")
+    d = d.dropna(subset=[c_date])
+    d["week"] = (d[c_date] - pd.to_timedelta(d[c_date].dt.weekday, unit="D")).dt.date.astype(str)
+
+    d[c_vol]  = pd.to_numeric(d[c_vol],  errors="coerce").fillna(0.0)
+    d[c_time] = pd.to_numeric(d[c_time], errors="coerce").fillna(0.0)
+
+    g = d.groupby("week", as_index=False)[[c_vol]].sum().rename(columns={c_vol: "_vol_"})
+    # weighted time per week
+    d["_num_"] = d[c_time] * d[c_vol]
+    w = d.groupby("week", as_index=False)[["_num_", c_vol]].sum()
+    w["_wt_"] = np.where(w[c_vol] > 0, w["_num_"] / w[c_vol], np.nan)
+
+    vol_w = dict(zip(g["week"], g["_vol_"]))
+    aht_or_sut_w = dict(zip(w["week"], w["_wt_"]))  # may be NaN if no volume
+
+    # Clean NaNs
+    aht_or_sut_w = {k: float(v) for k, v in aht_or_sut_w.items() if pd.notna(v) and v > 0}
+    vol_w        = {k: float(v) for k, v in vol_w.items()        if pd.notna(v) and v > 0}
+    return {"vol_w": vol_w, "aht_or_sut_w": aht_or_sut_w}
+
+# Build settings overrides (if any)
+voice_ovr = _settings_volume_aht_overrides(sk, "voice")
+bo_ovr    = _settings_volume_aht_overrides(sk, "bo")
+
 # _____________________ erlangs _____________________
 
 import math
@@ -2858,4 +2918,5 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         bulk_df.to_dict("records"),
         notes_df.to_dict("records"),
     )
+
 
