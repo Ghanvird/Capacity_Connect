@@ -5,6 +5,203 @@ from typing import Tuple, List, Optional
 import numpy as np
 import pandas as pd
 from itertools import cycle
+from cap_store import load_timeseries
+# --- ADD: helpers + precise rollups ------------------------------------------
+import re
+
+def week_floor(d: pd.Timestamp | str | dt.date, week_start: str = "Monday") -> dt.date:
+    d = pd.to_datetime(d).date()
+    wd = d.weekday()  # Mon=0..Sun=6
+    if (week_start or "Monday").lower().startswith("sun"):
+        # week starts on Sunday
+        return d - dt.timedelta(days=(wd + 1) % 7)
+    return d - dt.timedelta(days=wd)
+
+def add_week_month_keys(df: pd.DataFrame, date_col: str, week_start: str = "Monday") -> pd.DataFrame:
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.date
+    out["week"] = out[date_col].apply(lambda x: week_floor(x, week_start))
+    out["month"] = pd.to_datetime(out[date_col]).dt.to_period("M").dt.to_timestamp().dt.date
+    return out
+
+def _ivl_minutes_from_str(s: str | int | float, default: int = 30) -> int:
+    """Infer interval minutes from '09:00-09:30' etc.; else return default."""
+    try:
+        if isinstance(s, (int, float)) and not pd.isna(s):
+            v = int(s)
+            return v if v > 0 else default
+        st = str(s)
+        m = re.search(r"(\d{1,2}):(\d{2})\s*(?:-\s*(\d{1,2}):(\d{2}))?", st)
+        if m:
+            h1, m1 = int(m.group(1)), int(m.group(2))
+            if m.group(3):
+                h2, m2 = int(m.group(3)), int(m.group(4))
+                t1 = h1*60 + m1; t2 = h2*60 + m2
+                diff = (t2 - t1) % (24*60)
+                return diff if diff>0 else default
+    except Exception:
+        pass
+    return int(default)
+
+def voice_requirements_interval(voice_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
+    """
+    Input: interval rows with columns like ['date','interval','volume/calls','aht_sec', optional 'program'].
+    Output per interval:
+      ['date','interval','program','calls','aht_sec','A_erlangs','agents_req','service_level','occupancy','asa_sec','staff_seconds']
+    """
+    if not isinstance(voice_df, pd.DataFrame) or voice_df.empty:
+        return pd.DataFrame(columns=["date","interval","program","calls","aht_sec","A_erlangs","agents_req","service_level","occupancy","asa_sec","staff_seconds"])
+
+    df = voice_df.copy()
+    L = {c.lower(): c for c in df.columns}
+    date_c = L.get("date")
+    ivl_c  = L.get("interval") or L.get("interval_start") or L.get("time")
+    calls_c= L.get("calls") or L.get("volume")
+    aht_c  = L.get("aht_sec") or L.get("aht (sec)") or L.get("aht")
+    prog_c = L.get("program") or L.get("business area")
+
+    if not all([date_c, ivl_c, calls_c, aht_c]):
+        return pd.DataFrame(columns=["date","interval","program","calls","aht_sec","A_erlangs","agents_req","service_level","occupancy","asa_sec","staff_seconds"])
+
+    ivl_min  = int(settings.get("interval_minutes", 30) or 30)
+    target_sl= float(settings.get("target_sl", 0.8) or 0.8)
+    T_sec    = float(settings.get("sl_seconds", 20) or 20)
+    occ_cap  = float(settings.get("occupancy_cap_voice", 0.85) or 0.85)
+
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c], errors="coerce").dt.date,
+        "interval": df[ivl_c].astype(str),
+        "calls": pd.to_numeric(df[calls_c], errors="coerce"),
+        "aht_sec": pd.to_numeric(df[aht_c], errors="coerce"),
+        "program": (df[prog_c].astype(str) if prog_c else "All"),
+    }).dropna(subset=["date","interval","calls","aht_sec"])
+
+    # infer interval length per-row (supports mixed 15/30/60)
+    ivl_sec = out["interval"].map(lambda s: _ivl_minutes_from_str(s, ivl_min)).fillna(ivl_min).astype(int) * 60
+
+    rows = []
+    for i, r in out.iterrows():
+        calls = float(r["calls"] or 0.0)
+        aht   = float(r["aht_sec"] or 0.0)
+        ivalsec = int(ivl_sec.iloc[i])
+        ivlmin_row = max(5, round(ivalsec/60))
+        A = offered_load_erlangs(calls, aht, ivlmin_row)
+        N, sl, occ, asa_val = min_agents(calls, aht, ivlmin_row, target_sl, T_sec, occ_cap)
+        rows.append({
+            "date": r["date"], "interval": r["interval"], "program": r["program"],
+            "calls": calls, "aht_sec": aht,
+            "A_erlangs": A, "agents_req": N, "service_level": sl, "occupancy": occ, "asa_sec": asa_val,
+            "staff_seconds": N * ivalsec
+        })
+    res = pd.DataFrame(rows)
+    return res[["date","interval","program","calls","aht_sec","A_erlangs","agents_req","service_level","occupancy","asa_sec","staff_seconds"]]
+
+def voice_rollups(voice_ivl: pd.DataFrame, settings: dict, week_start: str = "Monday"):
+    """Interval → day/week/month FTE for Voice."""
+    if voice_ivl is None or voice_ivl.empty:
+        empty = pd.DataFrame(columns=["date","program","fte_req"])
+        return {"interval": pd.DataFrame(), "daily": empty, "weekly": empty, "monthly": empty}
+
+    shrink = float(settings.get("shrinkage_pct", 0.30) or 0.30)
+    hrs    = float(settings.get("hours_per_fte", 8.0) or 8.0)
+    denom  = hrs * 3600.0 * (1.0 - shrink)
+
+    base = voice_ivl.copy()
+    base["date"] = pd.to_datetime(base["date"]).dt.date
+    daily = (base.groupby(["date","program"], as_index=False)["staff_seconds"].sum())
+    daily["fte_req"] = daily["staff_seconds"] / max(1e-6, denom)
+    daily = daily[["date","program","fte_req"]].sort_values(["date","program"])
+
+    wk = add_week_month_keys(daily, "date", week_start)
+    weekly  = wk.groupby(["week","program"], as_index=False)["fte_req"].sum().rename(columns={"week":"start_week"})
+    monthly = wk.groupby(["month","program"], as_index=False)["fte_req"].sum().rename(columns={"month":"month_start"})
+    return {"interval": base, "daily": daily, "weekly": weekly, "monthly": monthly}
+
+def bo_rollups(bo_df: pd.DataFrame, settings: dict, week_start: str = "Monday"):
+    """Day → week/month FTE for Back Office."""
+    if bo_df is None or bo_df.empty:
+        empty = pd.DataFrame(columns=["date","program","fte_req"])
+        return {"daily": empty, "weekly": empty, "monthly": empty}
+
+    hrs    = float(settings.get("hours_per_fte", 8.0) or 8.0)
+    shrink = float(settings.get("shrinkage_pct", 0.30) or 0.30)
+    util   = float(settings.get("util_bo", 0.85) or 0.85)
+    denom  = hrs * 3600.0 * (1.0 - shrink) * util
+
+    df = bo_df.copy()
+    L = {c.lower(): c for c in df.columns}
+    date_c = L.get("date")
+    items_c= L.get("items") or L.get("volume")
+    aht_c  = L.get("aht_sec") or L.get("sut_sec") or L.get("sut")
+    prog_c = L.get("program") or L.get("business area")
+
+    if not all([date_c, items_c, aht_c]):
+        empty = pd.DataFrame(columns=["date","program","fte_req"])
+        return {"daily": empty, "weekly": empty, "monthly": empty}
+
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c], errors="coerce").dt.date,
+        "items": pd.to_numeric(df[items_c], errors="coerce"),
+        "aht_sec": pd.to_numeric(df[aht_c], errors="coerce"),
+        "program": (df[prog_c].astype(str) if prog_c else "All"),
+    }).dropna(subset=["date","items","aht_sec"])
+
+    out["work_seconds"] = out["items"] * out["aht_sec"]
+    daily = (out.groupby(["date","program"], as_index=False)["work_seconds"].sum())
+    daily["fte_req"] = daily["work_seconds"] / max(1e-6, denom)
+    daily = daily[["date","program","fte_req"]].sort_values(["date","program"])
+
+    wk = add_week_month_keys(daily, "date", week_start)
+    weekly  = wk.groupby(["week","program"], as_index=False)["fte_req"].sum().rename(columns={"week":"start_week"})
+    monthly = wk.groupby(["month","program"], as_index=False)["fte_req"].sum().rename(columns={"month":"month_start"})
+    return {"daily": daily, "weekly": weekly, "monthly": monthly}
+
+# --- REPLACE: required_fte_daily with accurate conversions --------------------
+def required_fte_daily(voice_df: pd.DataFrame, bo_df: pd.DataFrame, ob_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
+    """
+    Backward-compatible daily totals across Voice, Back Office and Outbound.
+    Voice: interval→day using agent-seconds→FTE conversion (time-weighted).
+    BO:    items×AHT seconds with util & shrinkage.
+    OB:    legacy daily formula kept.
+    Returns: ['date','program','voice_fte','bo_fte','ob_fte','total_req_fte']
+    """
+    frames = []
+
+    # Voice
+    try:
+        vi   = voice_requirements_interval(voice_df, settings)
+        vday = voice_rollups(vi, settings)["daily"].rename(columns={"fte_req": "voice_fte"})
+        frames.append(vday)
+    except Exception:
+        pass
+
+    # Back Office
+    try:
+        bday = bo_rollups(bo_df, settings)["daily"].rename(columns={"fte_req": "bo_fte"})
+        frames.append(bday)
+    except Exception:
+        pass
+
+    # Outbound (legacy)
+    if isinstance(ob_df, pd.DataFrame) and not ob_df.empty:
+        denom = float(settings["hours_per_fte"]) * 3600.0 * (1 - float(settings["shrinkage_pct"])) * float(settings.get("util_ob", 0.85))
+        o = ob_df.copy()
+        o["date"] = pd.to_datetime(o["date"]).dt.date
+        o["ob_fte"] = o.apply(lambda r: (float(r["calls"]) * float(r["aht_sec"])) / max(denom, 1e-6), axis=1)
+        o = o.groupby(["date","program"], as_index=False)["ob_fte"].sum()
+        frames.append(o)
+
+    if not frames:
+        return pd.DataFrame(columns=["date","program","voice_fte","bo_fte","ob_fte","total_req_fte"])
+
+    out = frames[0]
+    for f in frames[1:]:
+        out = pd.merge(out, f, on=["date","program"], how="outer")
+
+    for c in ["voice_fte","bo_fte","ob_fte"]:
+        if c not in out: out[c] = 0.0
+    out["total_req_fte"] = out[["voice_fte","bo_fte","ob_fte"]].fillna(0).sum(axis=1)
+    return out.fillna(0)
 
 # ─── Erlang / Queueing ───────────────────────────────────────
 def erlang_b(A: float, N: int) -> float:
@@ -208,53 +405,71 @@ def make_attrition_sample() -> pd.DataFrame:
     return pd.DataFrame({"week":[(sow - dt.timedelta(weeks=i)).isoformat() for i in [3,2,1,0]],
                          "attrition_pct":[0.7, 0.8, 0.9, 0.85], "program":["WFM"]*4})
 
+def assemble_voice(scope_key, which="forecast"):
+    vol = load_timeseries(f"voice_{which}_volume", scope_key)
+    aht = load_timeseries(f"voice_{which}_aht",    scope_key)
+    if vol.empty or aht.empty:
+        return pd.DataFrame(columns=["date","interval","volume","aht_sec","program"])
+    df = pd.merge(vol, aht, on=["date","interval"], how="inner")
+    df["program"] = "WFM"
+    return df[["date","interval","volume","aht_sec","program"]]
+
+def assemble_bo(scope_key, which="forecast"):
+    vol = load_timeseries(f"bo_{which}_volume", scope_key)
+    sut = load_timeseries(f"bo_{which}_sut",    scope_key)
+    if vol.empty or sut.empty:
+        return pd.DataFrame(columns=["date","items","aht_sec","program"])
+    df = pd.merge(vol, sut, on=["date"], how="inner")
+    df = df.rename(columns={"sut_sec":"aht_sec","items":"items"})
+    df["program"] = "WFM"
+    return df[["date","items","aht_sec","program"]]
 # ─── Core daily requirement/supply ───────────────────────────
-def required_fte_daily(voice_df: pd.DataFrame, bo_df: pd.DataFrame, ob_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
-    frames = []
-    # Voice per-interval → daily
-    if isinstance(voice_df, pd.DataFrame) and not voice_df.empty:
-        vrows = []
-        for _, r in voice_df.iterrows():
-            calls = float(r.get("volume", 0) or 0)
-            aht   = float(r.get("aht_sec", 0) or 0)
-            A     = offered_load_erlangs(calls, aht, int(settings["interval_minutes"]))
-            # use min agents; convert to FTE via shrinkage
-            N, sl, occ, asa_val = min_agents(calls, aht, int(settings["interval_minutes"]),
-                                             float(settings["target_sl"]), float(settings["sl_seconds"]),
-                                             float(settings["occupancy_cap_voice"]))
-            fte = N / max(1e-6, (1 - float(settings["shrinkage_pct"])))
-            vrows.append({"date": pd.to_datetime(r["date"]).date(), "program": r.get("program","WFM"),
-                          "fte_req": fte})
-        v = pd.DataFrame(vrows).groupby(["date","program"], as_index=False)["fte_req"].sum().rename(columns={"fte_req":"voice_fte"})
-        frames.append(v)
+# def required_fte_daily(voice_df: pd.DataFrame, bo_df: pd.DataFrame, ob_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
+#     frames = []
+#     # Voice per-interval → daily
+#     if isinstance(voice_df, pd.DataFrame) and not voice_df.empty:
+#         vrows = []
+#         for _, r in voice_df.iterrows():
+#             calls = float(r.get("volume", 0) or 0)
+#             aht   = float(r.get("aht_sec", 0) or 0)
+#             A     = offered_load_erlangs(calls, aht, int(settings["interval_minutes"]))
+#             # use min agents; convert to FTE via shrinkage
+#             N, sl, occ, asa_val = min_agents(calls, aht, int(settings["interval_minutes"]),
+#                                              float(settings["target_sl"]), float(settings["sl_seconds"]),
+#                                              float(settings["occupancy_cap_voice"]))
+#             fte = N / max(1e-6, (1 - float(settings["shrinkage_pct"])))
+#             vrows.append({"date": pd.to_datetime(r["date"]).date(), "program": r.get("program","WFM"),
+#                           "fte_req": fte})
+#         v = pd.DataFrame(vrows).groupby(["date","program"], as_index=False)["fte_req"].sum().rename(columns={"fte_req":"voice_fte"})
+#         frames.append(v)
 
-    # Backoffice (daily)
-    if isinstance(bo_df, pd.DataFrame) and not bo_df.empty:
-        denom = float(settings["hours_per_fte"]) * 3600.0 * (1 - float(settings["shrinkage_pct"])) * float(settings["util_bo"])
-        b = bo_df.copy()
-        b["date"] = pd.to_datetime(b["date"]).dt.date
-        b["bo_fte"] = b.apply(lambda r: (float(r["items"]) * float(r["aht_sec"])) / max(denom, 1e-6), axis=1)
-        b = b.groupby(["date","program"], as_index=False)["bo_fte"].sum()
-        frames.append(b)
+#     # Backoffice (daily)
+#     if isinstance(bo_df, pd.DataFrame) and not bo_df.empty:
+#         denom = float(settings["hours_per_fte"]) * 3600.0 * (1 - float(settings["shrinkage_pct"])) * float(settings["util_bo"])
+#         b = bo_df.copy()
+#         b["date"] = pd.to_datetime(b["date"]).dt.date
+#         b["bo_fte"] = b.apply(lambda r: (float(r["items"]) * float(r["aht_sec"])) / max(denom, 1e-6), axis=1)
+#         b = b.groupby(["date","program"], as_index=False)["bo_fte"].sum()
+#         frames.append(b)
 
-    # Outbound (daily)
-    if isinstance(ob_df, pd.DataFrame) and not ob_df.empty:
-        denom = float(settings["hours_per_fte"]) * 3600.0 * (1 - float(settings["shrinkage_pct"])) * float(settings["util_ob"])
-        o = ob_df.copy()
-        o["date"] = pd.to_datetime(o["date"]).dt.date
-        o["ob_fte"] = o.apply(lambda r: (float(r["calls"]) * float(r["aht_sec"])) / max(denom, 1e-6), axis=1)
-        o = o.groupby(["date","program"], as_index=False)["ob_fte"].sum()
-        frames.append(o)
+#     # Outbound (daily)
+#     if isinstance(ob_df, pd.DataFrame) and not ob_df.empty:
+#         denom = float(settings["hours_per_fte"]) * 3600.0 * (1 - float(settings["shrinkage_pct"])) * float(settings["util_ob"])
+#         o = ob_df.copy()
+#         o["date"] = pd.to_datetime(o["date"]).dt.date
+#         o["ob_fte"] = o.apply(lambda r: (float(r["calls"]) * float(r["aht_sec"])) / max(denom, 1e-6), axis=1)
+#         o = o.groupby(["date","program"], as_index=False)["ob_fte"].sum()
+#         frames.append(o)
 
-    if not frames:
-        return pd.DataFrame(columns=["date","program","voice_fte","bo_fte","ob_fte","total_req_fte"])
-    out = frames[0]
-    for f in frames[1:]:
-        out = pd.merge(out, f, on=["date","program"], how="outer")
-    for c in ["voice_fte","bo_fte","ob_fte"]:
-        if c not in out: out[c] = 0.0
-    out["total_req_fte"] = out[["voice_fte","bo_fte","ob_fte"]].fillna(0).sum(axis=1)
-    return out.fillna(0)
+#     if not frames:
+#         return pd.DataFrame(columns=["date","program","voice_fte","bo_fte","ob_fte","total_req_fte"])
+#     out = frames[0]
+#     for f in frames[1:]:
+#         out = pd.merge(out, f, on=["date","program"], how="outer")
+#     for c in ["voice_fte","bo_fte","ob_fte"]:
+#         if c not in out: out[c] = 0.0
+#     out["total_req_fte"] = out[["voice_fte","bo_fte","ob_fte"]].fillna(0).sum(axis=1)
+#     return out.fillna(0)
 
 def supply_fte_daily(roster: pd.DataFrame, hiring: pd.DataFrame) -> pd.DataFrame:
     if roster is None or roster.empty:
@@ -349,4 +564,5 @@ def _last_next_4(df: pd.DataFrame, week_col: str, value_col: str):
     last4 = float(past[value_col].mean()) if not past.empty else 0.0
     next4 = float(future[value_col].mean()) if not future.empty else last4
     return last4, next4
+
 
