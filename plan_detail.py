@@ -2215,7 +2215,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         weekly_voice_intervals = {}
     intervals_per_week_default = 7 * (24 * 3600 // ivl_sec)  # 336 for 24x7
 
-    # we’ll also keep the weekly demand used for SL
+    # demand used for SL
     weekly_demand_voice, weekly_demand_bo = {}, {}
 
     for w in week_ids:
@@ -2226,7 +2226,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         t_voice = _get(vT_w, w, v_vol_col_T, 0.0) if v_vol_col_T else 0.0
         t_bo    = _get(bT_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
 
-        # demand used for SL (Forecast→Actual→Tactical)
         weekly_demand_voice[w] = (f_voice if f_voice > 0 else (a_voice if a_voice > 0 else t_voice))
         weekly_demand_bo[w]    = (f_bo    if f_bo    > 0 else (a_bo    if a_bo    > 0 else t_bo))
 
@@ -2319,9 +2318,63 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     req_w_tactical = _daily_to_weekly(req_daily_tactical)
     req_w_budgeted = _daily_to_weekly(req_daily_budgeted)
 
-    # FW fallback to saved grid if needed
+    # ---------- FW overlay: user-entered AHT/SUT rows override computed ----------
     fw_saved = _load_or_blank(f"plan_{pid}_fw", spec["fw"], week_ids)
-    fw_to_use = fw if (isinstance(fw, pd.DataFrame) and not fw.empty) else fw_saved
+
+    def _merge_fw_user_overrides(fw_calc: pd.DataFrame, fw_user: pd.DataFrame, week_ids: list) -> pd.DataFrame:
+        """
+        Overlay user-entered FW rows onto the computed FW rows.
+        We override only Budgeted/Target (aka Planned) AHT/SUT rows (with tolerant matching).
+        """
+        if not isinstance(fw_calc, pd.DataFrame) or fw_calc.empty:
+            return fw_user if isinstance(fw_user, pd.DataFrame) else pd.DataFrame()
+
+        calc = fw_calc.copy()
+        if not isinstance(fw_user, pd.DataFrame) or fw_user.empty:
+            return calc
+
+        c = calc.set_index("metric")
+        u = fw_user.set_index("metric")
+
+        # make week columns numeric for safe coercion
+        for w in week_ids:
+            if w in c.columns: c[w] = pd.to_numeric(c[w], errors="coerce")
+            if w in u.columns: u[w] = pd.to_numeric(u[w], errors="coerce")
+
+        def _find_row(idx_like, *alts):
+            low = {str(k).strip().lower(): k for k in idx_like}
+            for a in alts:
+                k = str(a).strip().lower()
+                if k in low: return low[k]
+            # fallback: substring contains
+            for key, orig in low.items():
+                for a in alts:
+                    if str(a).strip().lower() in key:
+                        return orig
+            return None
+
+        budget_label_calc = _find_row(c.index, "Budgeted AHT/SUT", "Budget AHT/SUT", "Budget AHT", "Budget SUT")
+        target_label_calc = _find_row(c.index, "Target AHT/SUT",   "Planned AHT/SUT", "Planned AHT", "Planned SUT", "Target AHT", "Target SUT")
+
+        budget_label_user = _find_row(u.index, "Budgeted AHT/SUT", "Budget AHT/SUT", "Budget AHT", "Budget SUT")
+        target_label_user = _find_row(u.index, "Target AHT/SUT",   "Planned AHT/SUT", "Planned AHT", "Planned SUT", "Target AHT", "Target SUT")
+
+        def _apply(canon_label, user_label):
+            if not canon_label or not user_label:
+                return
+            for w in week_ids:
+                if w in u.columns and w in c.columns:
+                    val = u.at[user_label, w]
+                    if pd.notna(val):
+                        c.at[canon_label, w] = float(val)
+
+        _apply(budget_label_calc, budget_label_user)
+        _apply(target_label_calc, target_label_user)
+
+        return c.reset_index()
+
+    fw_to_use = _merge_fw_user_overrides(fw, fw_saved, week_ids)
+    # ---------------------------------------------------------------------------
 
     # Lower grids (start from what's saved, then overwrite with computed/uploaded)
     hc   = _load_or_blank(f"plan_{pid}_hc",   ["Budgeted HC (#)","Planned/Tactical HC (#)","Actual Agent HC (#)","SME Billable HC (#)"], week_ids)
@@ -2547,7 +2600,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
                 _agg_weekly(idx, ooo, ino, base)
 
     # ---- Write weekly values into the Shrinkage grid for THIS plan only ----------
-    # make SHR week columns float so we can write decimals safely
     for w in week_ids:
         if w not in shr.columns:
             shr[w] = np.nan
@@ -2566,7 +2618,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
             shr.loc[shr["metric"]=="OOO Shrinkage %",            w] = ooo_pct
             shr.loc[shr["metric"]=="Inoffice Shrinkage %",       w] = ino_pct
             shr.loc[shr["metric"]=="Overall Shrinkage %",        w] = ov_pct
-    # ---------------------------------------------------------------------------
 
     # --- Budget vs Actual ---
     for w in week_ids:
@@ -2649,7 +2700,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (asa_sec / max(1.0, aht_sec)))))
 
     def _erlang_calls_capacity(agents: float, aht_sec: float, asa_sec: int, ivl_sec: int, target_pct: float) -> float:
-        """Max calls per interval meeting target SL via binary search."""
+        """Max calls (or items) per interval meeting target SL via binary search."""
         if agents <= 0 or aht_sec <= 0 or ivl_sec <= 0:
             return 0.0
         target = float(target_pct)/100.0
@@ -2670,50 +2721,45 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     # --- Handling capacity (weekly) ---
     handling_capacity = {}
     for w in week_ids:
-        agents_eff = projected_supply[w] * occ_frac  # apply occupancy to supply
+        agents_eff_raw = projected_supply.get(w, 0.0) * occ_frac
+        agents_eff = max(1.0, float(agents_eff_raw))  # guard: Erlang needs >=1 agent
+
         if ch_first.lower() == "voice":
             aht = _first_positive(wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_aht, default=s_target_aht)
-            calls_per_ivl = _erlang_calls_capacity(agents_eff, max(1.0, aht), sl_seconds, ivl_sec, sl_target_pct)
-            intervals = int(weekly_voice_intervals.get(w) or intervals_per_week_default)
+            aht = max(1.0, float(aht))
+            n = weekly_voice_intervals.get(w)
+            intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
+            calls_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec, sl_target_pct)
             handling_capacity[w] = calls_per_ivl * intervals
         else:
             sut = _first_positive(wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_sut, default=s_target_sut)
-            items_per_ivl = _erlang_calls_capacity(agents_eff, max(1.0, sut), sl_seconds, ivl_sec, sl_target_pct)
+            sut = max(1.0, float(sut))
+            items_per_ivl = _erlang_calls_capacity(agents_eff, sut, sl_seconds, ivl_sec, sl_target_pct)
             handling_capacity[w] = items_per_ivl * intervals_per_week_default
 
-    # --- Projected Service Level (voice only) ---
+    # --- Projected Service Level (voice + non-voice) ---
     proj_sl = {}
     for w in week_ids:
-        if ch_first.lower() == "voice":
+        ch_l = ch_first.lower()
+        if ch_l == "voice":
             weekly_load = float(weekly_demand_voice.get(w, 0.0))
-            aht_sut = _first_positive(
-                wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_aht, default=s_target_aht
-            )
-            intervals = int(weekly_voice_intervals.get(w) or intervals_per_week_default)
-        elif ch_first.lower() in ("back office", "bo"):
-            weekly_load = float(weekly_demand_bo.get(w, 0.0))
-            aht_sut = _first_positive(
-                wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_sut, default=s_target_sut
-            )
-            intervals = intervals_per_week_default
+            aht_sut = _first_positive(wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_aht, default=s_target_aht)
+            n = weekly_voice_intervals.get(w)
+            intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
         else:
-            proj_sl[w] = 0.0
-            continue
+            weekly_load = float(weekly_demand_bo.get(w, 0.0))
+            aht_sut = _first_positive(wk_aht_sut_actual.get(w), wk_aht_sut_forecast.get(w), s_target_sut, default=s_target_sut)
+            intervals = intervals_per_week_default
 
         if weekly_load <= 0:
             proj_sl[w] = 0.0
             continue
 
         calls_per_ivl = weekly_load / float(max(1, intervals))
-        sl_frac = _erlang_sl(
-            calls_per_ivl,
-            max(1.0, aht_sut),
-            max(0.0, projected_supply[w] * occ_frac),
-            sl_seconds,
-            ivl_sec
-        )
+        agents_eff_raw = projected_supply.get(w, 0.0) * occ_frac
+        agents_eff = max(1.0, float(agents_eff_raw))
+        sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
         proj_sl[w] = 100.0 * sl_frac
-
 
     # ---------------------- Upper summary table -------------------------------
     upper_df = _blank_grid(spec["upper"], week_ids)
@@ -2786,13 +2832,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     # Round the "upper" values: keep 1 decimal for SL, else int
     if isinstance(upper_df, pd.DataFrame) and not upper_df.empty:
         for w in week_ids:
-            if w not in upper_df.columns: 
+            if w not in upper_df.columns:
                 continue
             mask_sl = upper_df["metric"].eq("Projected Service Level")
             mask_not_sl = ~mask_sl
-            # service level
             upper_df.loc[mask_sl, w] = pd.to_numeric(upper_df.loc[mask_sl, w], errors="coerce").fillna(0.0).round(1)
-            # everything else to int
             upper_df.loc[mask_not_sl, w] = pd.to_numeric(upper_df.loc[mask_not_sl, w], errors="coerce").fillna(0.0).round(0).astype(int)
 
     upper = dash_table.DataTable(
@@ -2814,3 +2858,4 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         bulk_df.to_dict("records"),
         notes_df.to_dict("records"),
     )
+
