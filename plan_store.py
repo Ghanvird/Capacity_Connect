@@ -1,220 +1,3 @@
-
-# # plan_store.py — lightweight persistence for Capacity Plans using your existing cap_db connection
-# from __future__ import annotations
-# import json, datetime as dt
-# from typing import List, Dict, Any, Optional, Tuple
-# import sqlite3
-# import json
-# from datetime import datetime
-
-# # Reuse the same DB file/connection as the rest of the app
-# from cap_db import _conn
-
-# def _init():
-#     with _conn() as cx:
-#         cx.execute("""
-#         CREATE TABLE IF NOT EXISTS capacity_plans (
-#             id INTEGER PRIMARY KEY AUTOINCREMENT,
-#             org TEXT,
-#             business_entity TEXT,
-#             vertical TEXT,            -- Business Area
-#             sub_ba TEXT,
-#             channel TEXT,
-#             site TEXT,
-#             plan_name TEXT NOT NULL,
-#             plan_type TEXT,
-#             start_week TEXT,          -- YYYY-MM-DD (Monday)
-#             end_week TEXT,            -- YYYY-MM-DD
-#             ft_weekly_hours REAL,
-#             pt_weekly_hours REAL,
-#             tags TEXT,                -- JSON list
-#             is_current INTEGER DEFAULT 0,
-#             status TEXT DEFAULT 'draft',  -- 'current' | 'history' | 'draft'
-#             hierarchy_json TEXT,      -- optional BA/SubBA/Channels/Sites bundle
-#             owner TEXT,
-#             created_at TEXT NOT NULL,
-#             updated_at TEXT NOT NULL
-#         )
-#         """)
-#         cx.commit()
-
-# _init()
-
-# def _now():
-#     return dt.datetime.utcnow().isoformat()
-
-
-
-# def _norm_channel_csv(x) -> str:
-#     """Return a normalized, sorted CSV for a channel field that may be a list or CSV."""
-#     if x is None:
-#         return ""
-#     if isinstance(x, (list, tuple)):
-#         parts = [str(v).strip().lower() for v in x if str(v).strip()]
-#     else:
-#         parts = [p.strip().lower() for p in str(x).split(",") if p.strip()]
-#     # dedupe + sort -> canonical text
-#     parts = sorted(set(parts))
-#     return ", ".join(parts)
-
-# def create_plan(payload: dict) -> int:
-#     with _conn() as cx:
-#         vertical   = (payload.get("vertical") or "").strip()
-#         sub_ba     = (payload.get("sub_ba") or "").strip()
-#         name       = (payload.get("plan_name") or "").strip()
-#         site       = (payload.get("site") or "").strip()
-#         chan_norm  = _norm_channel_csv(payload.get("channel"))
-#         is_current = 1 if payload.get("is_current") else 0
-#         status     = payload.get("status") or ("current" if is_current else "draft")
-
-#         # ---- duplicate guard (BA+SBA, same (channel-set, site, plan_name)) ----
-#         rows = cx.execute(
-#             """
-#             SELECT id, channel, site, plan_name
-#             FROM capacity_plans
-#             WHERE LOWER(vertical) = LOWER(?)
-#               AND COALESCE(sub_ba,'') = COALESCE(?, '')
-#               AND LOWER(TRIM(plan_name)) = LOWER(?)
-#               AND LOWER(COALESCE(TRIM(site),'')) = LOWER(COALESCE(?, ''))
-#             """,
-#             (vertical, sub_ba, name, site)
-#         ).fetchall()
-
-#         for r in rows:
-#             if _norm_channel_csv(r["channel"]) == chan_norm:
-#                 # same channel-set + site + plan_name → reject
-#                 raise ValueError("Duplicate: same Channel, Site and Plan Name already exist for this SBA.")
-
-#         # demote other current plans only for SAME (vertical, sub_ba)
-#         if is_current:
-#             cx.execute(
-#                 """
-#                 UPDATE capacity_plans
-#                    SET is_current = 0, status = 'history'
-#                  WHERE vertical = ?
-#                    AND COALESCE(NULLIF(sub_ba,''),'Overall') = COALESCE(NULLIF(?,''),'Overall')
-#                    AND is_current = 1
-#                 """,
-#                 (vertical, sub_ba)
-#             )
-
-#         # payload cleanup
-#         p = payload.copy()
-#         # store channel as normalized CSV
-#         p["channel"] = chan_norm
-#         # tags -> JSON text
-#         if isinstance(p.get("tags"), (list, dict)):
-#             p["tags"] = json.dumps(p["tags"])
-#         elif p.get("tags") is None:
-#             p["tags"] = ""
-
-#         p["is_current"] = is_current
-#         p["status"] = status
-
-#         # add timestamps if columns exist
-#         cols = [r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)").fetchall()]
-#         now  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-#         if "created_at" in cols and "created_at" not in p:
-#             p["created_at"] = now
-#         if "updated_at" in cols and "updated_at" not in p:
-#             p["updated_at"] = now
-
-#         fields_all = [
-#             "org","business_entity","vertical","sub_ba","channel","location","site",
-#             "plan_name","plan_type","start_week","end_week",
-#             "ft_weekly_hours","pt_weekly_hours","tags","is_current","status","hierarchy_json",
-#             "created_at","updated_at"
-#         ]
-#         fields = [f for f in fields_all if f in cols]
-#         sql = f"INSERT INTO capacity_plans ({', '.join(fields)}) VALUES ({', '.join(':'+f for f in fields)})"
-
-#         cur = cx.execute(sql, p)
-#         pid = cur.lastrowid
-#         cx.commit()
-#         return pid
-
-# def set_plan_status(plan_id: int, status: str):
-#     assert status in ("current","history","draft")
-#     ts = _now()
-#     with _conn() as cx:
-#         if status == "current":
-#             # fetch scope
-#             row = cx.execute("SELECT vertical, sub_ba, channel, site FROM capacity_plans WHERE id=?", (plan_id,)).fetchone()
-#             if row:
-#                 cx.execute("""UPDATE capacity_plans
-#                               SET is_current=0, status='history', updated_at=?
-#                               WHERE vertical=? AND IFNULL(sub_ba,'') IS IFNULL(?, '')
-#                                     AND IFNULL(channel,'') IS IFNULL(?, '')
-#                                     AND IFNULL(site,'') IS IFNULL(?, '') AND id<>?""",
-#                            (ts, row["vertical"], row["sub_ba"], row["channel"], row["site"], plan_id))
-#         cx.execute("UPDATE capacity_plans SET status=?, is_current=?, updated_at=? WHERE id=?",
-#                    (status, 1 if status=="current" else 0, ts, plan_id))
-#         cx.commit()
-
-# def list_business_areas(status_filter: Optional[str] = "current") -> List[str]:
-#     q = "SELECT DISTINCT vertical FROM capacity_plans"
-#     args = []
-#     if status_filter:
-#         q += " WHERE status=?"
-#         args.append(status_filter)
-#     with _conn() as cx:
-#         rows = cx.execute(q, args).fetchall()
-#         return sorted([r["vertical"] for r in rows if r["vertical"]])
-
-# def list_plans(vertical: Optional[str] = None,
-#                status_filter: Optional[str] = None,
-#                include_deleted: bool = False) -> List[Dict]:
-#     """
-#     Returns plans. If a soft-delete column exists (deleted_at), it will be
-#     ignored unless include_deleted=True. If the column doesn't exist, it just works.
-#     """
-#     sql = "SELECT * FROM capacity_plans WHERE 1=1"
-#     params: list = []
-
-#     if vertical:
-#         sql += " AND vertical=?"; params.append(vertical)
-
-#     if status_filter == "current":
-#         sql += " AND is_current=1"
-#     elif status_filter == "history":
-#         sql += " AND status='history'"
-#     elif status_filter == "draft":
-#         sql += " AND status='draft'"
-
-#     with _conn() as cx:
-#         # Only filter deleted_at if the column exists
-#         cols = {r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)")}
-#         if "deleted_at" in cols and not include_deleted:
-#             sql += " AND deleted_at IS NULL"
-
-#         rows = cx.execute(sql + " ORDER BY created_at DESC", params).fetchall()
-#         return [dict(r) for r in rows]
-
-# def mark_history(plan_id: int):
-#     set_plan_status(plan_id, "history")
-
-# def get_plan(plan_id: int) -> Optional[Dict[str,Any]]:
-#     with _conn() as cx:
-#         row = cx.execute("SELECT * FROM capacity_plans WHERE id=?", (plan_id,)).fetchone()
-#         return dict(row) if row else None
-
-
-# def delete_plan(plan_id: int, hard_if_missing: bool = True) -> None:
-#     """
-#     Deletes a plan. If a 'deleted_at' column exists, soft-delete it.
-#     Otherwise (or on error), hard-delete the row.
-#     """
-#     with _conn() as cx:
-#         cols = {r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)")}
-#         try:
-#             if "deleted_at" in cols:
-#                 cx.execute("UPDATE capacity_plans SET deleted_at=datetime('now') WHERE id=?", (plan_id,))
-#             elif hard_if_missing:
-#                 cx.execute("DELETE FROM capacity_plans WHERE id=?", (plan_id,))
-#         finally:
-#             cx.commit()
-
-# plan_store.py — lightweight persistence for Capacity Plans using your existing cap_db connection
 from __future__ import annotations
 import json
 import datetime as dt
@@ -380,6 +163,8 @@ def create_plan(payload: dict) -> int:
             "created_at","updated_at"
         ]
         fields = [f for f in fields_all if f in cols]
+        for f in fields:
+            p.setdefault(f, None)
         sql = f"INSERT INTO capacity_plans ({', '.join(fields)}) VALUES ({', '.join(':'+f for f in fields)})"
 
         cur = cx.execute(sql, p)
@@ -392,7 +177,8 @@ def create_plan(payload: dict) -> int:
 # ──────────────────────────────────────────────────────────────────────────────
 def set_plan_status(plan_id: int, status: str):
     assert status in ("current", "history", "draft")
-    ts = _now_iso()
+    # ts = _now_iso()
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S") 
     with _conn() as cx:
         if status == "current":
             row = cx.execute(
@@ -434,28 +220,26 @@ def set_plan_status(plan_id: int, status: str):
 # Reads / Deletes
 # ──────────────────────────────────────────────────────────────────────────────
 def list_business_areas(status_filter: Optional[str] = "current") -> List[str]:
-    q = "SELECT DISTINCT vertical FROM capacity_plans"
+    q = "SELECT DISTINCT vertical FROM capacity_plans WHERE 1=1"
     args: list = []
     if status_filter:
-        q += " WHERE status=?"
-        args.append(status_filter)
+        q += " AND status=?"; args.append(status_filter)
     with _conn() as cx:
+        cols = {r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)")}
+        if "is_deleted" in cols:
+            q += " AND COALESCE(is_deleted,0)=0"
+        elif "deleted_at" in cols:
+            q += " AND deleted_at IS NULL"
         rows = cx.execute(q, args).fetchall()
         return sorted([r["vertical"] for r in rows if r["vertical"]])
 
 def list_plans(vertical: Optional[str] = None,
                status_filter: Optional[str] = None,
                include_deleted: bool = False) -> List[Dict]:
-    """
-    Returns plans. If a soft-delete column exists (deleted_at), it will be
-    ignored unless include_deleted=True. If the column doesn't exist, it just works.
-    """
     sql = "SELECT * FROM capacity_plans WHERE 1=1"
     params: list = []
-
     if vertical:
         sql += " AND vertical=?"; params.append(vertical)
-
     if status_filter == "current":
         sql += " AND is_current=1"
     elif status_filter == "history":
@@ -465,8 +249,12 @@ def list_plans(vertical: Optional[str] = None,
 
     with _conn() as cx:
         cols = {r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)")}
-        if "deleted_at" in cols and not include_deleted:
-            sql += " AND deleted_at IS NULL"
+
+        if not include_deleted:
+            if "is_deleted" in cols:
+                sql += " AND COALESCE(is_deleted,0)=0"
+            elif "deleted_at" in cols:
+                sql += " AND deleted_at IS NULL"
 
         rows = cx.execute(sql + " ORDER BY created_at DESC", params).fetchall()
         return [dict(r) for r in rows]
@@ -480,14 +268,12 @@ def get_plan(plan_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 def delete_plan(plan_id: int, hard_if_missing: bool = True) -> None:
-    """
-    Deletes a plan. If a 'deleted_at' column exists, soft-delete it.
-    Otherwise (or on error), hard-delete the row.
-    """
     with _conn() as cx:
         cols = {r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)")}
         try:
-            if "deleted_at" in cols:
+            if "is_deleted" in cols:
+                cx.execute("UPDATE capacity_plans SET is_deleted=1, updated_at=datetime('now') WHERE id=?", (plan_id,))
+            elif "deleted_at" in cols:
                 cx.execute("UPDATE capacity_plans SET deleted_at=datetime('now') WHERE id=?", (plan_id,))
             elif hard_if_missing:
                 cx.execute("DELETE FROM capacity_plans WHERE id=?", (plan_id,))
