@@ -472,3 +472,28 @@ h6 {
 #main-navbar { position: relative; z-index: 1000; }
 #main-navbar .navbar-brand { pointer-events: auto; cursor: pointer; }
 .breadcrumb a { pointer-events: auto; }
+
+.ghanii {
+    color: #3a5166 !important;
+    margin-left: 11px !important;
+    margin-top: 10px !important;
+    margin-bottom: 10px !important;
+}
+
+#bud-voice-start .DateInput { width: 200px !important; font-size: small; }
+#bud-voice-start .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#bud-voice-start .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#btn-bud-voice-tmpl:hover, #btn-bud-bo-tmpl:hover{
+  background: #6c757d;
+  color: #fff;
+}
+
+#btn-bud-voice-tmpl, #btn-bud-bo-tmpl{
+  color: #6c757d;
+  border-color: #6c757d;
+}
+
+#bud-bo-start .DateInput { width: 200px !important; font-size: small; }
+#bud-bo-start .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#bud-bo-start .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
