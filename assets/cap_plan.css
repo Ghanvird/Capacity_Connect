@@ -82,6 +82,11 @@
     color: #585858;
 }
 
+#plan-tabs {
+  display: flex !important;
+  justify-content: space-between !important;
+}
+
 /* ─────────────────────────────────────────────
    SCOPE: only style DataTables inside #cp-plan-detail
    and those with class .cp-grid
@@ -284,10 +289,89 @@
 #inp-prod-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
 #inp-prod-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
 
+#tp-date-from .DateInput { width: 200px !important; font-size: small; }
+#tp-date-from .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#tp-date-from .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#tp-date-to .DateInput { width: 200px !important; font-size: small; }
+#tp-date-to .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#tp-date-to .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
 #modal-roster-crumb {
   border: 1px solid #d1cece;
   padding-left: 5px !important;
   border-radius: 6px;
   padding-top: 6px !important;
   padding-bottom: 6px !important;
+}
+
+.mb-2.rahul, .mb-2.ghanvir {
+  margin-top: 1rem !important;
+  margin-bottom: 1rem !important;
+  align-items: center;
+}
+
+.mb-2.ruhi, .mb-2.rudra, .mb-2.angad, .mb-2.ghanvir1, .mb-2.ghanvir2 {
+  margin-bottom: 1rem !important;
+  align-items: center;
+}
+
+#promo-date-from .DateInput {width: 220px !important; font-size: small;}
+#promo-date-from .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#promo-date-from .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#promo-date-to .DateInput {width: 220px !important; font-size: small;}
+#promo-date-to .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#promo-date-to .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#twp-date-from .DateInput {width: 220px !important; font-size: small;}
+#twp-date-from .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#twp-date-from .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#twp-date-to .DateInput {width: 220px !important; font-size: small;}
+#twp-date-to .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#twp-date-to .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#inp-loa-date .DateInput { width: 200px !important; font-size: small; }
+#inp-loa-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-loa-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#inp-back-date .DateInput { width: 200px !important; font-size: small; }
+#inp-back-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-back-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#inp-term-date .DateInput { width: 200px !important; font-size: small; }
+#inp-term-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-term-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#inp-ftp-date .DateInput { width: 200px !important; font-size: small; }
+#inp-ftp-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-ftp-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+.form-label {
+  margin-right: 10px !important;
+}
+
+#tbl-fw .dash-spreadsheet-container .column-0, 
+#tbl-hc .dash-spreadsheet-container .column-0, 
+#tbl-attr .dash-spreadsheet-container .column-0,
+#tbl-shr .dash-spreadsheet-container .column-0,
+#tbl-train .dash-spreadsheet-container .column-0,
+#tbl-ratio .dash-spreadsheet-container .column-0,
+#tbl-seat .dash-spreadsheet-container .column-0,
+#tbl-bva .dash-spreadsheet-container .column-0,
+#tbl-nh .dash-spreadsheet-container .column-0 {
+  min-width: 280px;
+  position: sticky;
+  left: 0;
+}
+
+#tbl-upper .dash-spreadsheet-container .column-0{
+  position: sticky;
+  left: 0;
+}
+
+.ddd {
+  margin-left: -23px !important;
+  margin-right: -23px !important;
 }
