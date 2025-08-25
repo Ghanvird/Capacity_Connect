@@ -3,15 +3,18 @@ from __future__ import annotations
 import os, platform, getpass, base64, io, datetime as dt
 import pandas as pd
 import numpy as np
+from typing import List
 from planning_workspace import planning_layout, register_planning_ws
 from dash import Dash, html, dcc, dash_table, Output, Input, State, callback
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 import plotly.express as px
 import dash
+from datetime import date, timedelta
 from plan_store import get_plan
 from cap_db import save_df, load_df
 from plan_detail import layout_for_plan, plan_detail_validation_layout, register_plan_detail
+
 # ---- Core math & demo (replace with real when ready) ----
 from capacity_core import (
     required_fte_daily, supply_fte_daily, understaffed_accounts_next_4w,
@@ -21,7 +24,7 @@ from capacity_core import (
     make_shrinkage_sample, make_attrition_sample, _last_next_4, min_agents
 )
 
-# ---- SQLite persistence & dynamic sources ----
+# ---- SQLite persistence & dynamic sources (NO Mapping 1 anywhere) ----
 from cap_store import (
     init_db, load_defaults, save_defaults, save_roster_long, save_roster_wide,
     load_roster, save_roster, load_roster_long, load_roster_wide,
@@ -29,15 +32,13 @@ from cap_store import (
     load_shrinkage, save_shrinkage,
     load_attrition, save_attrition,
     save_scoped_settings, resolve_settings,
-    get_roster_locations, get_clients_hierarchy, save_mapping_sheet1, load_mapping_sheet1,
-    save_mapping_sheet2, load_mapping_sheet2,
-    mapping_sheet1_template_df, mapping_sheet2_template_df,ensure_indexes
+    ensure_indexes, save_timeseries, brid_manager_map,
+    load_headcount, level2_to_journey_map, load_timeseries, get_clients_hierarchy
 )
-
-ensure_indexes()
 
 # Initialize DB file
 init_db()
+ensure_indexes()
 
 SYSTEM_NAME = (os.environ.get("HOSTNAME") or getpass.getuser() or platform.node())
 
@@ -50,16 +51,612 @@ app = Dash(
 )
 server = app.server
 
+def _save_budget_hc_timeseries(key: str, dff: pd.DataFrame):
+    """Also persist weekly headcount for the HC tab.
+       Planned HC = Budget HC (per your requirement)."""
+    if dff is None or dff.empty:
+        return
+    if not {"week","budget_headcount"}.issubset(dff.columns):
+        return
+    hc = dff[["week","budget_headcount"]].copy()
+    hc["week"] = pd.to_datetime(hc["week"], errors="coerce").dt.date.astype(str)
+    hc.rename(columns={"budget_headcount":"headcount"}, inplace=True)
+
+    # store both budget and planned (planned = budget)
+    save_timeseries("hc_budget",  key, hc)   # week, headcount
+    save_timeseries("hc_planned", key, hc)   # week, headcount
+
+
+def _first_non_empty_ts(scope_key: str, keys: list[str]) -> pd.DataFrame:
+    """Return the first non-empty timeseries DF for any of the given keys."""
+    for k in keys:
+        try:
+            df = load_timeseries(k, scope_key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+def _canon_scope(ba, sba, ch):
+    canon = lambda x: (x or '').strip().lower()
+    return f"{canon(ba)}|{canon(sba)}|{canon(ch)}"
+
+def _coerce_time(s):
+    s = str(s).strip()
+    # Accept "09:00", "9:00", "900" → "09:00"
+    if ":" in s:
+        h, m = s.split(":")[0:2]
+        return f"{int(h):02d}:{int(m):02d}"
+    if s.isdigit():
+        s = s.zfill(4)
+        return f"{int(s[:2]):02d}:{int(s[2:]):02d}"
+    return ""
+
+def _minutes_to_seconds(x):
+    # Accept "HH:MM" or number of minutes; return seconds
+    s = str(x).strip()
+    if ":" in s:
+        h, m = s.split(":")[0:2]
+        return (int(h)*60 + int(m)) * 60
+    try:
+        return float(s) * 60.0
+    except:
+        return None
+
+def _week_monday(x):
+    d = pd.to_datetime(x, errors="coerce")
+    if pd.isna(d): return None
+    d = d.normalize()
+    return (d - pd.Timedelta(days=int(d.weekday()))).date()
+
+def _scope_key(ba, subba, channel):
+    return f"{(ba or '').strip()}|{(subba or '').strip()}|{(channel or '').strip()}"
+
+def _budget_voice_template(start_week=None, weeks=8):
+    start = _week_monday(start_week or pd.Timestamp.today())
+    rows = []
+    for w in range(weeks):
+        wk = (pd.Timestamp(start) + pd.Timedelta(weeks=w)).date()
+        rows.append(dict(week=wk.isoformat(), budget_headcount=25 + (w%3)*5, budget_aht_sec=300))
+    return pd.DataFrame(rows, columns=["week","budget_headcount","budget_aht_sec"])
+
+def _budget_bo_template(start_week=None, weeks=8):
+    start = _week_monday(start_week or pd.Timestamp.today())
+    rows = []
+    for w in range(weeks):
+        wk = (pd.Timestamp(start) + pd.Timedelta(weeks=w)).date()
+        rows.append(dict(week=wk.isoformat(), budget_headcount=30 + (w%2)*3, budget_sut_sec=600))
+    return pd.DataFrame(rows, columns=["week","budget_headcount","budget_sut_sec"])
+
+def _budget_normalize_voice(df):
+    if df is None or df.empty: return pd.DataFrame(columns=["week","budget_headcount","budget_aht_sec"])
+    L = {c.lower(): c for c in df.columns}
+    wk = L.get("week") or L.get("start_week") or L.get("monday") or list(df.columns)[0]
+    hc = L.get("budget_headcount") or "budget_headcount"
+    aht= L.get("budget_aht_sec") or "budget_aht_sec"
+    dff = df.rename(columns={wk:"week"}).copy()
+    if hc not in dff: dff[hc] = None
+    if aht not in dff: dff[aht] = None
+    dff["week"] = dff["week"].map(_week_monday).astype(str)
+    dff["budget_headcount"] = pd.to_numeric(dff[hc], errors="coerce")
+    dff["budget_aht_sec"]   = pd.to_numeric(dff[aht], errors="coerce")
+    dff = dff.dropna(subset=["week"]).drop_duplicates(subset=["week"], keep="last")
+    return dff[["week","budget_headcount","budget_aht_sec"]]
+
+def _budget_normalize_bo(df):
+    if df is None or df.empty: return pd.DataFrame(columns=["week","budget_headcount","budget_sut_sec"])
+    L = {c.lower(): c for c in df.columns}
+    wk = L.get("week") or L.get("start_week") or L.get("monday") or list(df.columns)[0]
+    hc = L.get("budget_headcount") or "budget_headcount"
+    sut= L.get("budget_sut_sec") or "budget_sut_sec"
+    dff = df.rename(columns={wk:"week"}).copy()
+    if hc not in dff: dff[hc] = None
+    if sut not in dff: dff[sut] = None
+    dff["week"] = dff["week"].map(_week_monday).astype(str)
+    dff["budget_headcount"] = pd.to_numeric(dff[hc], errors="coerce")
+    dff["budget_sut_sec"]   = pd.to_numeric(dff[sut], errors="coerce")
+    dff = dff.dropna(subset=["week"]).drop_duplicates(subset=["week"], keep="last")
+    return dff[["week","budget_headcount","budget_sut_sec"]]
+
+
+# === SHRINKAGE (RAW) — helpers & templates ====================================
+
+def _hhmm_to_minutes(x) -> float:
+    if pd.isna(x): return 0.0
+    s = str(x).strip()
+    if not s: return 0.0
+    # allow "HH:MM", "H:MM", "MM", "H.MM" etc.
+    m = None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) >= 2:
+            try:
+                h = int(parts[0]); mm = int(parts[1])
+                return float(h * 60 + mm)
+            except Exception:
+                pass
+    try:
+        # fallback: numeric minutes
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _hc_lookup():
+    """Return simple dict lookups from headcount: BRID→{lm_name, site, city, country, journey, level_3}"""
+    try:
+        hc = load_headcount()
+    except Exception:
+        hc = pd.DataFrame()
+    if not isinstance(hc, pd.DataFrame) or hc.empty:
+        return {}
+    L = {c.lower(): c for c in hc.columns}
+    def col(name):
+        return L.get(name, name)
+    out = {}
+    for _, r in hc.iterrows():
+        brid = str(r.get(col("brid"), "")).strip()
+        if not brid: 
+            continue
+        out[brid] = dict(
+            lm_name = r.get(col("line_manager_full_name")),
+            site    = r.get(col("position_location_building_description")),
+            city    = r.get(col("position_location_city")),
+            country = r.get(col("position_location_country")),
+            journey = r.get(col("journey")),
+            level_3 = r.get(col("level_3")),
+        )
+    return out
+
+# ---- Back Office RAW template (seconds) ----
+def shrinkage_bo_raw_template_df(rows: int = 16) -> pd.DataFrame:
+    today = pd.Timestamp.today().normalize().date()
+    cats = [
+        "Staff Complement","Flextime","Borrowed Staff","Lend Staff",
+        "Overtime","Core Time","Diverted","Downtime","Time Worked","Work out"
+    ]
+    demo = []
+    for i in range(rows):
+        cat = cats[i % len(cats)]
+        dur = 1800 if cat in ("Diverted","Downtime") else (3_600 if cat in ("Core Time","Time Worked") else 1200)
+        brid = f"IN{1000+i}"
+        demo.append({
+            "Category":"Shrinkage", "StartDate": today.isoformat(), "EndDate": today.isoformat(),
+            "DateId": int(pd.Timestamp(today).strftime("%Y%m%d")),
+            "Date": today.isoformat(),
+            "GroupId": "BO1", "WorkgroupId": "WG1", "WorkgroupName": "BO Cases",
+            "Activity": cat,
+            "SaffMemberId": brid, "StaffLastName": "Doe", "SatffFirstName": "Alex",
+            "StaffReferenceId": brid, "TaskId": "T-001", "Units": 10 if cat=="Work out" else 0,
+            "DurationSeconds": dur, "EmploymentType": "FT",
+            "AgentID(BRID)": brid, "Agent Name": "Alex Doe",
+            "TL Name": "",  # will be filled from Headcount on upload
+            "Time": round(dur/3600,2),
+            "Sub Business Area": ""  # will be filled from Headcount (Level 3)
+        })
+    return pd.DataFrame(demo)
+
+# ---- Voice RAW template (HH:MM) ----
+def shrinkage_voice_raw_template_df(rows: int = 18) -> pd.DataFrame:
+    today = pd.Timestamp.today().normalize().date()
+    superstates = [
+        "SC_INCLUDED_TIME","SC_ABSENCE_TOTAL","SC_A_Sick_Long_Term",
+        "SC_HOLIDAY","SC_TRAINING_TOTAL","SC_BREAKS","SC_SYSTEM_EXCEPTION"
+    ]
+    demo = []
+    for i in range(rows):
+        ss = superstates[i % len(superstates)]
+        hhmm = f"{(i%3)+1:02d}:{(i*10)%60:02d}"  # 01:00, 02:10, 03:20...
+        brid = f"UK{2000+i}"
+        demo.append({
+            "Employee": f"User {i+1}",
+            "BRID": brid, "First Name": "Sam", "Last Name": "Patel",
+            "Superstate": ss, "Date": today.isoformat(), "Day of Week": "Mon",
+            "Day": int(pd.Timestamp(today).day), "Month": int(pd.Timestamp(today).month),
+            "Year": int(pd.Timestamp(today).year), "Week Number": int(pd.Timestamp(today).week),
+            "Week of": (pd.Timestamp(today) - pd.Timedelta(days=pd.Timestamp(today).weekday())).date().isoformat(),
+            "Hours": hhmm, "Management_Line": "", "Location": "", "CSM": "",
+            "Monthly":"", "Weekly":"", "Business Area":"", "Sub Business Area":"", "Channel":"Voice"
+        })
+    return pd.DataFrame(demo)
+
+# ---- Back Office RAW normalize + summary ----
+def normalize_shrinkage_bo(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    L = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n.lower() in L: return L[n.lower()]
+        return None
+    # columns (case-insensitive)
+    col_act  = pick("Activity")
+    col_sec  = pick("DurationSeconds","Duration (sec)","duration_seconds")
+    col_date = pick("Date")
+    col_units = pick("Units")
+    col_brid = pick("AgentID(BRID)","StaffReferenceId","SaffMemberId","StaffMemberId","BRID")
+    col_fname = pick("SatffFirstName","StaffFirstName","FirstName")
+    col_lname = pick("StaffLastName","LastName")
+    if not (col_act and col_sec and col_date and col_brid):
+        return pd.DataFrame()
+
+    dff = df.copy()
+    dff.rename(columns={
+        col_act:"activity", col_sec:"duration_seconds", col_date:"date",
+        col_units: "units" if col_units else "units",
+        col_brid: "brid",
+        col_fname or "": "first_name", col_lname or "": "last_name"
+    }, inplace=True, errors="ignore")
+
+    dff["date"] = pd.to_datetime(dff["date"], errors="coerce").dt.date
+    dff["duration_seconds"] = pd.to_numeric(dff["duration_seconds"], errors="coerce").fillna(0).astype(float)
+    if "units" in dff.columns:
+        dff["units"] = pd.to_numeric(dff["units"], errors="coerce").fillna(0).astype(float)
+    else:
+        dff["units"] = 0.0
+    dff["brid"] = dff["brid"].astype(str).str.strip()
+
+    # enrich from headcount
+    hc = _hc_lookup()
+    dff["tl_name"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("lm_name"))
+    dff["journey"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("journey"))
+    dff["sub_business_area"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("level_3"))
+    dff["time_hours"] = dff["duration_seconds"] / 3600.0
+    dff["channel"] = "Back Office"
+    return dff
+
+def _bo_bucket(activity: str) -> str:
+    s = (activity or "").strip().lower()
+    # flexible matching
+    if "divert" in s: return "diverted"
+    if "down" in s: return "downtime"
+    if "staff complement" in s or s == "staff complement": return "staff_complement"
+    if "flex" in s: return "flextime"
+    if "lend" in s: return "lend_staff"
+    if "borrow" in s: return "borrowed_staff"
+    if "overtime" in s or s=="ot": return "overtime"
+    if "core time" in s or s=="core": return "core_time"
+    if "time worked" in s: return "time_worked"
+    if "work out" in s or "workout" in s: return "work_out"
+    return "other"
+
+def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
+    if dff is None or dff.empty: return pd.DataFrame()
+    d = dff.copy()
+    d["bucket"] = d["activity"].map(_bo_bucket)
+
+    keys = ["date","journey","sub_business_area","channel"]
+    # seconds per bucket
+    sec = d.pivot_table(index=keys, columns="bucket", values="duration_seconds", aggfunc="sum", fill_value=0).reset_index()
+    if "work_out" not in sec.columns: sec["work_out"] = 0.0
+    if "time_worked" not in sec.columns: sec["time_worked"] = 0.0
+    if "core_time" not in sec.columns: sec["core_time"] = 0.0
+    if "overtime" not in sec.columns: sec["overtime"] = 0.0
+    if "diverted" not in sec.columns: sec["diverted"] = 0.0
+    if "downtime" not in sec.columns: sec["downtime"] = 0.0
+    if "staff_complement" not in sec.columns: sec["staff_complement"] = 0.0
+    if "flextime" not in sec.columns: sec["flextime"] = 0.0
+    if "lend_staff" not in sec.columns: sec["lend_staff"] = 0.0
+    if "borrowed_staff" not in sec.columns: sec["borrowed_staff"] = 0.0
+
+    # denominator for shrinkage (all seconds)
+    sec["shr_num"]  = sec["diverted"] + sec["downtime"]
+    sec["shr_denom"] = (sec["staff_complement"] + sec["flextime"] + sec["overtime"] - sec["lend_staff"] + sec["borrowed_staff"]).clip(lower=0)
+
+    # metrics
+    sec["shrinkage_pct"] = np.where(sec["shr_denom"]>0, (sec["shr_num"]/sec["shr_denom"])*100.0, np.nan)
+    # productivity = Work out / Core Time (units per hour)
+    sec["productivity_u_per_hr"] = np.where(sec["core_time"]>0, (sec.get("work_out",0.0) / (sec["core_time"]/3600.0)), np.nan)
+    # utilisation = Core Time / Time Worked
+    denom_tw = np.where(sec["time_worked"]>0, sec["time_worked"], sec["staff_complement"] + sec["flextime"] + sec["overtime"])  # fallback
+    sec["utilisation_pct"] = np.where(denom_tw>0, (sec["core_time"]/denom_tw)*100.0, np.nan)
+    # OT hours
+    sec["ot_hours"] = sec["overtime"] / 3600.0
+
+    keep = keys + ["shrinkage_pct","productivity_u_per_hr","utilisation_pct","ot_hours","shr_num","shr_denom"]
+    sec = sec[keep].sort_values(keys)
+    # nice names
+    sec = sec.rename(columns={"journey":"Business Area","sub_business_area":"Sub Business Area"})
+    return sec
+
+def weekly_shrinkage_from_bo_summary(daily: pd.DataFrame) -> pd.DataFrame:
+    if daily is None or daily.empty: return pd.DataFrame(columns=["week","attrition_pct","program"])
+    df = daily.copy()
+    df["week"] = pd.to_datetime(df["date"]).dt.date.apply(lambda x: _week_floor(x,"Monday"))
+    # program = Business Area
+    df["program"] = df["Business Area"].fillna("All").astype(str)
+    grp = df.groupby(["week","program"], as_index=False).agg({"shr_num":"sum","shr_denom":"sum"})
+    grp["shrinkage_pct"] = np.where(grp["shr_denom"]>0, (grp["shr_num"]/grp["shr_denom"])*100.0, np.nan)
+    return grp[["week","shrinkage_pct","program"]]
+
+# ---- Voice RAW normalize + summary ----
+def normalize_shrinkage_voice(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    L = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n.lower() in L: return L[n.lower()]
+        return None
+    col_date = pick("Date")
+    col_state = pick("Superstate")
+    col_hours = pick("Hours")
+    col_brid  = pick("BRID","AgentID(BRID)","Employee Id","EmployeeID")
+    if not (col_date and col_state and col_hours and col_brid):
+        return pd.DataFrame()
+
+    dff = df.copy()
+    dff.rename(columns={col_date:"date", col_state:"superstate", col_hours:"hours_raw", col_brid:"brid"}, inplace=True)
+    dff["date"] = pd.to_datetime(dff["date"], errors="coerce").dt.date
+    dff["brid"] = dff["brid"].astype(str).str.strip()
+    # convert HH:MM -> minutes, then to hours (as per spec they divide by 60)
+    mins = dff["hours_raw"].map(_hhmm_to_minutes).fillna(0.0)
+    dff["hours"] = mins/60.0
+
+    # enrich from headcount
+    hc = _hc_lookup()
+    dff["TL Name"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("lm_name"))
+    dff["Site"]    = dff["brid"].map(lambda x: (hc.get(x) or {}).get("site"))
+    dff["City"]    = dff["brid"].map(lambda x: (hc.get(x) or {}).get("city"))
+    dff["Country"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("country"))
+    dff["Business Area"] = dff.get("Business Area", pd.Series(index=dff.index)).fillna(dff["brid"].map(lambda x: (hc.get(x) or {}).get("journey")))
+    dff["Sub Business Area"] = dff.get("Sub Business Area", pd.Series(index=dff.index)).fillna(dff["brid"].map(lambda x: (hc.get(x) or {}).get("level_3")))
+    if "Channel" not in dff.columns:
+        dff["Channel"] = "Voice"
+
+    # NEW: defaults so the pivot in summarize_shrinkage_voice never drops rows
+    for col, default in [("Business Area", "All"), ("Sub Business Area", "All"), ("Country", "All")]:
+        if col not in dff.columns:
+            dff[col] = default
+        else:
+            dff[col] = dff[col].replace("", np.nan).fillna(default)
+    dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Voice")
+    return dff
+
+def summarize_shrinkage_voice(dff: pd.DataFrame) -> pd.DataFrame:
+    if dff is None or dff.empty: return pd.DataFrame()
+    d = dff.copy()
+
+    # Use Country only if present and not entirely NaN
+    keys = ["date","Business Area","Sub Business Area","Channel"]
+    if "Country" in d.columns and d["Country"].notna().any():
+        keys.append("Country")
+
+    piv = d.pivot_table(index=keys, columns="superstate", values="hours", aggfunc="sum", fill_value=0.0).reset_index()
+    inc = piv.get("SC_INCLUDED_TIME", pd.Series([0.0]*len(piv)))
+
+    def part(code): return piv[code] if code in piv.columns else 0.0
+    abs_h  = part("SC_ABSENCE_TOTAL")
+    lts_h  = part("SC_A_Sick_Long_Term")
+    hol_h  = part("SC_HOLIDAY")
+    trn_h  = part("SC_TRAINING_TOTAL")
+    brk_h  = part("SC_BREAKS")
+    sys_h  = part("SC_SYSTEM_EXCEPTION")
+
+    def ratio(x): return np.where(inc>0, (x / inc) * 100.0, np.nan)
+    piv["Absence %"]        = ratio(abs_h)
+    piv["LTS %"]            = ratio(lts_h)
+    piv["Holiday %"]        = ratio(hol_h)
+    piv["Training %"]       = ratio(trn_h)
+    piv["Breaks %"]         = ratio(brk_h)
+    piv["Total Shrink %"]   = piv[["Absence %","Holiday %","Training %","Breaks %"]].sum(axis=1, min_count=1)
+    piv["System Downtime %"]= ratio(sys_h)
+    piv["Paid Hours"]       = inc
+
+    keep = keys + ["Absence %","LTS %","Holiday %","Training %","Breaks %","Total Shrink %","System Downtime %","Paid Hours"]
+    return piv[keep].sort_values(keys)
+
+
+def weekly_shrinkage_from_voice_summary(daily: pd.DataFrame) -> pd.DataFrame:
+    if daily is None or daily.empty: return pd.DataFrame(columns=["week","shrinkage_pct","program"])
+    df = daily.copy()
+    df["week"] = pd.to_datetime(df["date"]).dt.date.apply(lambda x: _week_floor(x,"Monday"))
+    df["program"] = df["Business Area"].fillna("All").astype(str)
+    # compute weekly Total Shrink weighted by included time (Paid Hours)
+    grp = df.groupby(["week","program"], as_index=False).agg({
+        "Total Shrink %":"mean",         # simple mean across BA/program/day
+        "Paid Hours":"sum"
+    })
+    # If you prefer time-weighted shrink %, replace with:
+    # grp["Total Shrink %"] = (weight sum of component hours) / (weight sum of inc) * 100
+    grp = grp.rename(columns={"Total Shrink %":"shrinkage_pct"})
+    return grp[["week","shrinkage_pct","program"]]
+
+
+# ---------- BRID enrichment using headcount ----------
+def enrich_with_manager(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Team Manager/Manager BRID to a wide or long roster using BRID mapping."""
+    if df is None or df.empty:
+        return df
+    try:
+        mgr = brid_manager_map()  # columns: brid, line_manager_brid, line_manager_full_name
+    except Exception:
+        return df
+    if mgr is None or mgr.empty:
+        return df
+
+    out = df.copy()
+    L = {str(c).lower(): c for c in out.columns}
+    brid_col = L.get("brid") or L.get("employee id") or L.get("employee_id") or ("BRID" if "BRID" in out.columns else None)
+    if not brid_col:
+        return out
+
+    out = out.merge(mgr, left_on=brid_col, right_on="brid", how="left")
+    if "Team Manager" not in out.columns:
+        out["Team Manager"] = out["line_manager_full_name"]
+    else:
+        out["Team Manager"] = out["Team Manager"].fillna(out["line_manager_full_name"])
+    if "Manager BRID" not in out.columns:
+        out["Manager BRID"] = out["line_manager_brid"]
+    return out.drop(columns=["brid", "line_manager_full_name", "line_manager_brid"], errors="ignore")
+
+# ===== Headcount-only helpers (Scope) =====
+def _hcu_df() -> pd.DataFrame:
+    try:
+        df = load_headcount()
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _hcu_cols(df: pd.DataFrame) -> dict:
+    """
+    Column resolver (case-insensitive) for the Headcount Update file.
+      - ba: Journey / Business Area (a.k.a. Vertical)
+      - sba: Level 3 (Sub Business Area)
+      - loc: Country / Location
+      - site: Building / Site
+      - lob: Channel / Program if present (fallback handled later)
+    """
+    L = {str(c).strip().lower(): c for c in df.columns}
+
+    ba = (
+        L.get("journey")
+        or L.get("business area")
+        or L.get("vertical")
+        or L.get("current org unit description")
+        or L.get("current_org_unit_description")
+        or L.get("level 0")
+        or L.get("level_0")
+    )
+    sba = (
+        L.get("level 3")
+        or L.get("level_3")
+        or L.get("sub business area")
+        or L.get("sub_business_area")
+    )
+    loc = (
+        L.get("position_location_country")
+        or L.get("location country")
+        or L.get("location_country")
+        or L.get("country")
+        or L.get("location")
+    )
+    site = (
+        L.get("position_location_building_description")
+        or L.get("building description")
+        or L.get("building")
+        or L.get("site")
+    )
+    lob = (
+        L.get("lob")
+        or L.get("channel")
+        or L.get("program")
+        or L.get("position group")
+        or L.get("position_group")
+    )
+    return {"ba": ba, "sba": sba, "loc": loc, "site": site, "lob": lob}
+
+CHANNEL_LIST = ["Voice", "Back Office", "Outbound", "Blended", "Chat", "MessageUs"]
+
+def _all_locations() -> List[str]:
+    df = _hcu_df()
+    if df.empty: return []
+    C = _hcu_cols(df)
+    c = C["loc"]
+    if not c: return []
+    vals = (
+        df[c].dropna().astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _bas_from_headcount() -> List[str]:
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not C["ba"]:
+        return []
+    vals = (
+        df[C["ba"]]
+        .dropna().astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _sbas_from_headcount(ba: str) -> List[str]:
+    if not ba:
+        return []
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["sba"]):
+        return []
+    dff = df[[C["ba"], C["sba"]]].dropna()
+    dff = dff[dff[C["ba"]].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    vals = (
+        dff[C["sba"]]
+        .astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _lobs_for_ba_sba(ba: str, sba: str) -> List[str]:
+    """If headcount has a LOB/Channel column, use it; else fall back to fixed list."""
+    if not (ba and sba):
+        return []
+    df = _hcu_df()
+    if df.empty: return CHANNEL_LIST
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["sba"] and C["lob"]):
+        return CHANNEL_LIST
+    dff = df[[C["ba"], C["sba"], C["lob"]]].dropna()
+    mask = (
+        dff[C["ba"]].astype(str).str.strip().str.lower().eq(str(ba).strip().lower()) &
+        dff[C["sba"]].astype(str).str.strip().str.lower().eq(str(sba).strip().lower())
+    )
+    vals = (
+        dff.loc[mask, C["lob"]]
+        .astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    # return vals.tolist() or CHANNEL_LIST
+    return CHANNEL_LIST
+
+def _locations_for_ba(ba: str) -> List[str]:
+    if not ba:
+        return []
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["loc"]):
+        return []
+    dff = df[[C["ba"], C["loc"]]].dropna()
+    dff = dff[dff[C["ba"]].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    vals = (
+        dff[C["loc"]]
+        .astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _sites_for_ba_location(ba: str, location: str | None) -> List[str]:
+    if not ba:
+        return []
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["site"]):
+        return []
+    dff = df[df[C["ba"]].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    if C["loc"] and location:
+        dff = dff[dff[C["loc"]].astype(str).str.strip().str.lower() == str(location).strip().lower()]
+    vals = (
+        dff[C["site"]]
+        .dropna().astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+# ---------------------- MAIN LAYOUT (unchanged shell) ----------------------
 def _planning_ids_skeleton():
-    # Only cross-page Stores. Do NOT mount Planning controls here.
     return html.Div([
         dcc.Store(id="ws-status"),
         dcc.Store(id="ws-selected-ba"),
         dcc.Store(id="ws-refresh"),
-        # removed: planning-mounted (unused)
     ], style={"display": "none"})
 
-# ✅ MAIN LAYOUT — do NOT include planning_layout() here
 app.layout = html.Div([
     dcc.Location(id="url-router"),
     dcc.Store(id="sidebar_collapsed", data=True, storage_type="session"),
@@ -67,7 +664,8 @@ app.layout = html.Div([
     html.Div(id="app-wrapper", className="sidebar-collapsed", children=[
         html.Div(id="sidebar"),
         html.Div(id="root")
-    ])
+    ]),
+    dcc.Interval(id="cap-plans-refresh", interval=5000, n_intervals=0)
 ])
 
 # ---------------------- Demo data for Home ----------------------
@@ -95,9 +693,7 @@ hire_lw, hire_tw, hire_nw = kpi_hiring(hiring_demo)
 shr_last4, shr_next4 = kpi_shrinkage(shrink_demo)
 attr_last4, attr_next4 = _last_next_4(attr_demo, "week", "attrition_pct")
 
-# ---------------------- Helpers ----------------------
-
-# ===== Attrition (RAW) schema + template =====
+# ---------------------- Helpers (templates & normalizers) ----------------------
 ATTRITION_RAW_COLUMNS = [
     "Reporting Full Date","BRID","Employee Name","Operational Status",
     "Corporate Grade Description","Employee Email Address","Employee Position",
@@ -109,173 +705,174 @@ ATTRITION_RAW_COLUMNS = [
     "HC","FTE"
 ]
 
-def build_attrition_raw_template(rows: int = 3) -> pd.DataFrame:
-    """Create a CSV-ready template with your exact 29 columns, with a few example rows."""
-    today = dt.date.today()
-    ex = []
-    for i in range(rows):
-        ex.append({
-            "Reporting Full Date": (today - dt.timedelta(days=7-i)).isoformat(),
-            "BRID": f"IN{i+1:04d}",
-            "Employee Name": ["Asha Rao","Alex Doe","Priya Singh"][i % 3],
-            "Operational Status": "Exited",
-            "Corporate Grade Description": "G6",
-            "Employee Email Address": f"user{i+1}@example.com",
-            "Employee Position": "Analyst",
-            "Position Description": "Ops Analyst",
-            "Employee Line Manager Indicator": "No",
-            "Length of Service Date": (today - dt.timedelta(days=365*(i+1))).isoformat(),
-            "Cost Centre": "COST-1001",
-            "Line Manager BRID": f"LM{i+1:03d}",
-            "Line Manager Name": ["Chris Lee","Priyanka Menon","Sam Patel"][i % 3],
-            "IMH L05": "IMH5",
-            "IMH L06": "IMH6",
-            "IMH L07": "IMH7",
-            "Org Unit": "Operations",
-            "Org Unit ID": "OU-01",
-            "Employee Line Manager lvl 07": "Mgr7",
-            "Employee Line Manager lvl 08": "Mgr8",
-            "Employee Line Manager lvl 09": "Mgr9",
-            "City": ["Chennai","Glasgow","Pune"][i % 3],
-            "Building": "HQ",
-            "Gender Description": ["Female","Male","Female"][i % 3],
-            "Voluntary Involuntary Exit Description": "Voluntary",
-            "Resignation Date": (today - dt.timedelta(days=5-i)).isoformat(),
-            "Employee Contract HC": 1,
-            "HC": 1,
-            "FTE": 1.0
-        })
-    df = pd.DataFrame(ex, columns=ATTRITION_RAW_COLUMNS)
-    return df
-
-# ---------- Pretty column names (render-only) ----------
-PRETTY_LABELS = {
-    # common time keys
-    "date": "Date",
-    "week": "Week",
-    "start_week": "Start Week",
-    "interval": "Interval",
-    # metrics
-    "aht_sec": "AHT (sec)",
-    "asa_sec": "ASA (sec)",
-    "volume": "Volume",
-    "items": "Items",
-    "calls": "Calls",
-    "agents_req": "Agents Required",
-    "fte_req": "Billable FTE Required",
-    "supply_fte": "Supply FTE",
-    "total_req_fte": "Total Required FTE",
-    "staffing_pct": "Staffing %",
-    "shrinkage_pct": "Shrinkage %",
-    "attrition_pct": "Attrition %",
-    "occupancy": "Occupancy",
-    "service_level": "Service Level",
-    # entities
-    "program": "Program",
-    "campaign": "Campaign",
-    "sub_task": "Sub Task",
-    "tranche": "Tranche",
-    # roster columns
-    "employee_id": "Employee ID",
-    "name": "Name",
-    "status": "Status",
-    "fte": "FTE",
-    "skill_voice": "Skill: Voice",
-    "skill_bo": "Skill: Back Office",
-    "skill_ob": "Skill: Outbound",
-    "start_date": "Start Date",
-    "end_date": "End Date",
-    "location": "Location",
-    "country": "Country",
-    "site": "Site",
-    "region": "Region",
-    # generic
-    "leavers_fte": "Leavers FTE",
-    "avg_active_fte": "Avg Active FTE",
-}
-
-# ==== Roster wide template helpers (Dash) ====
-def build_roster_template_wide(start_date: dt.date, end_date: dt.date, include_sample: bool = False) -> pd.DataFrame:
-    """
-    Headers:
-      BRID, Name, Team Manager, Business Area, Sub Business Area, LOB, Site, Location, Country, <date columns...>
-    """
-    base_cols = [
-        "BRID", "Name", "Team Manager",
-        "Business Area", "Sub Business Area", "LOB",
-        "Site", "Location", "Country"
+HC_COLUMNS = [
+    "Level 0","Level 1","Level 2","Level 3","Level 4","Level 5","Level 6",
+    "BRID","Full Name","Position Description","Headcount Operational Status Description",
+    "Employee Group Description","Corporate Grade Description","Line Manager BRID","Line Manager Full Name",
+    "Current Organisation Unit","Current Organisation Unit Description",
+    "Position Location Country","Position Location City","Position Location Building Description",
+    "CCID","CC Name","Journey","Position Group"
+]
+def headcount_template_df(rows: int = 5) -> pd.DataFrame:
+    sample = [
+        ["BUK","COO","Business Services","BFA","Refers","","","IN0001","Asha Rao","Agent","Active","FT","BA4","IN9999","Priyanka Menon","Ops|BFA|Refers","Ops BFA Refers","India","Chennai","DLF IT Park","12345","Complaints","Onboarding","Agent"],
+        ["BUK","COO","Business Services","BFA","Appeals","","","IN0002","Rahul Jain","Team Leader","Active","FT","BA5","IN8888","Arjun Mehta","Ops|BFA|Appeals","Ops BFA Appeals","India","Pune","EON Cluster C","12345","Complaints","Onboarding","Team Leader"],
     ]
-    if not isinstance(start_date, dt.date):
-        start_date = pd.to_datetime(start_date).date()
-    if not isinstance(end_date, dt.date):
-        end_date = pd.to_datetime(end_date).date()
-    if start_date > end_date:
-        start_date, end_date = end_date, start_date
-
-    date_cols = [(start_date + dt.timedelta(days=i)).isoformat()
-                 for i in range((end_date - start_date).days + 1)]
-    cols = base_cols + date_cols
-    df = pd.DataFrame(columns=cols)
-
-    if include_sample and date_cols:
-        r1 = {c: "" for c in cols}
-        r1.update({
-            "BRID": "IN0001", "Name": "Asha Rao", "Team Manager": "Priyanka Menon",
-            "Business Area": "Retail", "Sub Business Area": "Cards", "LOB": "Back Office",
-            "Site": "Chennai", "Location": "IN-Chennai", "Country": "India",
-            date_cols[0]: "09:00-17:30"
-        })
-        r2 = {c: "" for c in cols}
-        r2.update({
-            "BRID": "UK0002", "Name": "Alex Doe", "Team Manager": "Chris Lee",
-            "Business Area": "Retail", "Sub Business Area": "Cards", "LOB": "Voice",
-            "Site": "Glasgow", "Location": "UK-Glasgow", "Country": "UK",
-            date_cols[0]: "Leave"
-        })
-        if len(date_cols) > 1:
-            r1[date_cols[1]] = "10:00-18:00"
-        df = pd.DataFrame([r1, r2])[cols]
-
+    df = pd.DataFrame(sample[:rows], columns=HC_COLUMNS)
+    if rows > len(sample):
+        df = pd.concat([df, pd.DataFrame(columns=HC_COLUMNS)], ignore_index=True)
     return df
 
+# === New combined templates (as requested) ===
+def voice_forecast_template_df():
+    # Same columns as schema
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Interval": "09:00",
+        "Forecast Volume": 120,
+        "Forecast AHT": 300,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Voice",
+    }])
 
-def normalize_roster_wide(df_wide: pd.DataFrame) -> pd.DataFrame:
+def voice_actual_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Interval": "09:00",
+        "Actual Volume": 115,
+        "Actual AHT": 310,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Voice",
+    }])
+
+def bo_forecast_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Forecast Volume": 550,
+        "Forecast SUT": 600,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Back Office",
+    }])
+
+def bo_actual_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Actual Volume": 520,
+        "Actual SUT": 610,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Back Office",
+    }])
+
+# === Normalizers for new combined sheets ===
+def _norm_voice_combo(df: pd.DataFrame, kind: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Wide → long:
-      id cols: BRID, Name, Team Manager, Business Area, Sub Business Area, LOB, Site, Location, Country
-      result: those id cols + date + entry (free text like '09:00-17:30' or 'Leave')
+    Return (vol_df, aht_df) in internal normalized shapes for saving:
+      vol_df: date, interval_start, volume
+      aht_df: date, interval_start, aht_sec
+    Accepts either Forecast or Actual columns depending on 'kind'.
     """
-    if df_wide is None or df_wide.empty:
-        return pd.DataFrame(columns=[
-            "BRID","Name","Team Manager","Business Area","Sub Business Area",
-            "LOB","Site","Location","Country","date","entry"
-        ])
-    id_cols = ["BRID","Name","Team Manager","Business Area","Sub Business Area","LOB","Site","Location","Country"]
-    id_cols = [c for c in id_cols if c in df_wide.columns]  # tolerate partial
-    date_cols = [c for c in df_wide.columns if c not in id_cols]
-    long = df_wide.melt(id_vars=id_cols, value_vars=date_cols, var_name="date", value_name="entry")
-    long["entry"] = long["entry"].fillna("").astype(str).str.strip()
-    long = long[long["entry"] != ""]
-    long["date"] = pd.to_datetime(long["date"], errors="coerce", dayfirst=True).dt.date
-    long = long[pd.notna(long["date"])]
-    long["is_leave"] = long["entry"].str.lower().isin(["leave", "l", "off", "pto"])
-    return long
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date","interval_start","volume"]), pd.DataFrame(columns=["date","interval_start","aht_sec"])
+    L = {str(c).lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            c = L.get(n.lower())
+            if c: return c
+        return None
 
-
-def pretty_col(col: str) -> str:
-    if not isinstance(col, str):
-        return str(col)
-    return PRETTY_LABELS.get(col, col.replace("_", " ").title())
-
-def pretty_columns(df_or_cols) -> list[dict]:
-    if hasattr(df_or_cols, "columns"):
-        cols = list(df_or_cols.columns)
+    date_col = pick("date")
+    intv_col = pick("interval","interval start","intervalstart","time","slot")
+    if kind == "forecast":
+        vol_col = pick("forecast volume","volume")
+        aht_col = pick("forecast aht","aht","aht (sec)")
     else:
-        cols = list(df_or_cols)
-    return [{"name": pretty_col(c), "id": c} for c in cols]
+        vol_col = pick("actual volume","volume")
+        aht_col = pick("actual aht","aht","aht (sec)")
+
+    if not (date_col and intv_col and vol_col and aht_col):
+        return pd.DataFrame(), pd.DataFrame()
+
+    df2 = df[[date_col, intv_col, vol_col, aht_col]].copy()
+    df2.columns = ["date","interval_start","volume","aht_sec"]
+    df2["date"] = pd.to_datetime(df2["date"], errors="coerce").dt.date.astype(str)
+    df2["interval_start"] = df2["interval_start"].astype(str).str.extract(r"(\d{1,2}:\d{2})")[0]
+    df2["volume"] = pd.to_numeric(df2["volume"], errors="coerce").fillna(0)
+    df2["aht_sec"] = pd.to_numeric(df2["aht_sec"], errors="coerce").fillna(0)
+    df2 = df2.dropna(subset=["date","interval_start"])
+    df2 = df2.drop_duplicates(["date","interval_start"], keep="last").sort_values(["date","interval_start"])
+
+    vol_df = df2[["date","interval_start","volume"]].copy()
+    aht_df = df2[["date","interval_start","aht_sec"]].copy()
+    return vol_df, aht_df
+
+def _norm_bo_combo(df: pd.DataFrame, kind: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Return (vol_df, sut_df) in internal normalized shapes for saving:
+      vol_df: date, volume
+      sut_df: date, sut_sec
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date","volume"]), pd.DataFrame(columns=["date","sut_sec"])
+    L = {str(c).lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            c = L.get(n.lower())
+            if c: return c
+        return None
+
+    date_col = pick("date")
+    if kind == "forecast":
+        vol_col = pick("forecast volume","volume")
+        sut_col = pick("forecast sut","sut","sut (sec)")
+    else:
+        vol_col = pick("actual volume","volume")
+        sut_col = pick("actual sut","sut","sut (sec)")
+
+    if not (date_col and vol_col and sut_col):
+        return pd.DataFrame(), pd.DataFrame()
+
+    df2 = df[[date_col, vol_col, sut_col]].copy()
+    df2.columns = ["date","volume","sut_sec"]
+    df2["date"] = pd.to_datetime(df2["date"], errors="coerce").dt.date.astype(str)
+    df2["volume"] = pd.to_numeric(df2["volume"], errors="coerce").fillna(0)
+    df2["sut_sec"] = pd.to_numeric(df2["sut_sec"], errors="coerce").fillna(0)
+    df2 = df2.dropna(subset=["date"]).drop_duplicates(["date"], keep="last").sort_values(["date"])
+
+    vol_df = df2[["date","volume"]].copy()
+    sut_df = df2[["date","sut_sec"]].copy()
+    return vol_df, sut_df
+
+# ---------- Parsing helpers ----------
+def pretty_columns(df_or_cols) -> list[dict]:
+    cols = list(df_or_cols.columns) if hasattr(df_or_cols, "columns") else list(df_or_cols)
+    return [{"name": c, "id": c} for c in cols]
+
+def lock_variance_cols(cols):
+    """
+    Return a copy of DataTable column defs with any Variance columns set read-only.
+    Matches on id or header text containing 'variance' (case-insensitive).
+    """
+    out = []
+    for col in cols:
+        c = dict(col)  # copy
+        name_txt = c.get("name", "")
+        if isinstance(name_txt, list):  # sometimes headers are multi-line arrays
+            name_txt = " ".join(map(str, name_txt))
+        id_txt = str(c.get("id", ""))
+        if "variance" in str(name_txt).lower() or "variance" in id_txt.lower():
+            c["editable"] = False
+        else:
+            # make other columns explicitly editable unless already set
+            c.setdefault("editable", True)
+        out.append(c)
+    return out
+
 
 def parse_upload(contents, filename) -> pd.DataFrame:
-    """Parse CSV/XLSX/XLSM from dcc.Upload."""
     if not contents:
         return pd.DataFrame()
     try:
@@ -289,175 +886,18 @@ def parse_upload(contents, filename) -> pd.DataFrame:
         pass
     return pd.DataFrame()
 
-def _week_floor(d: pd.Timestamp | str | dt.date, week_start: str = "Monday") -> dt.date:
-    d = pd.to_datetime(d).date()
-    wd = d.weekday()  # Mon=0..Sun=6
-    if (week_start or "Monday").lower().startswith("sun"):
-        return d - dt.timedelta(days=(wd + 1) % 7)
-    return d - dt.timedelta(days=wd)
-
-def weekly_avg_active_fte_from_roster(week_start: str = "Monday") -> pd.DataFrame:
-    """
-    Returns weekly average 'active FTE' for denominator.
-    Prefers classic roster (start_date/end_date/fte). If that’s empty, falls back to roster_long.
-    """
-    roster = load_roster()
-    if isinstance(roster, pd.DataFrame) and (not roster.empty) and {"start_date","fte"}.issubset(roster.columns):
-        def _to_date(x):
-            try: return pd.to_datetime(x).date()
-            except Exception: return None
-
-        r = roster.copy()
-        r["sd"] = r["start_date"].apply(_to_date)
-        r["ed"] = (r["end_date"] if "end_date" in r.columns else pd.Series([None]*len(r))).apply(_to_date)
-        sd_min = min([d for d in r["sd"].dropna()] or [dt.date.today()])
-        ed_max = max([d for d in r["ed"].dropna()] or [dt.date.today() + dt.timedelta(days=180)])
-        if ed_max < sd_min: ed_max = sd_min + dt.timedelta(days=180)
-
-        days = pd.date_range(sd_min, ed_max, freq="D").date
-        rows = []
-        for _, row in r.iterrows():
-            sd = row["sd"] or sd_min
-            ed = row["ed"] or ed_max
-            fte = float(row.get("fte", 0) or 0)
-            if fte <= 0: continue
-            start, end = max(sd, sd_min), min(ed, ed_max)
-            for d in days:
-                if start <= d <= end:
-                    rows.append({"date": d, "fte": fte})
-        if not rows:
-            return pd.DataFrame(columns=["week","avg_active_fte"])
-
-        daily = pd.DataFrame(rows).groupby("date", as_index=False)["fte"].sum()
-        daily["week"] = daily["date"].apply(lambda x: _week_floor(x, week_start))
-        weekly = daily.groupby("week", as_index=False)["fte"].mean().rename(columns={"fte":"avg_active_fte"})
-        return weekly.sort_values("week")
-
-    # 2) Fallback: use normalized roster_long (distinct BRIDs per day -> FTE=1)
-    try:
-        long = load_roster_long()
-    except Exception:
-        long = None
-    if long is None or long.empty or "date" not in long.columns:
-        return pd.DataFrame(columns=["week","avg_active_fte"])
-
-    df = long.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-    df = df.dropna(subset=["date"])
-
-    id_col = "BRID" if "BRID" in df.columns else ("employee_id" if "employee_id" in df.columns else None)
-    if not id_col:
-        return pd.DataFrame(columns=["week","avg_active_fte"])
-
-    daily = df.groupby(["date"], as_index=False)[id_col].nunique().rename(columns={id_col:"fte"})
-    daily["week"] = daily["date"].apply(lambda x: _week_floor(x, week_start))
-    weekly = daily.groupby("week", as_index=False)["fte"].mean().rename(columns={"fte":"avg_active_fte"})
-    return weekly.sort_values("week")
-
-
-def attrition_weekly_from_raw(df_raw: pd.DataFrame, week_start: str = "Monday") -> pd.DataFrame:
-    """
-    Leavers list (raw) -> weekly % using roster denominator, and 'program' = Business Area
-    via Mapping Sheet 2 (IMH 06 -> Business Area Nomenclature). Falls back gracefully.
-    """
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame(columns=["week","leavers_fte","avg_active_fte","attrition_pct","program"])
-
-    df = df_raw.copy()
-
-    # Normalize resignation date column
-    if "Resignation Date" not in df.columns:
-        if "Reporting Full Date" in df.columns:
-            df["Resignation Date"] = df["Reporting Full Date"]
-        else:
-            return pd.DataFrame(columns=["week","leavers_fte","avg_active_fte","attrition_pct","program"])
-    df = df[~df["Resignation Date"].isna()].copy()
-
-    # FTE default
-    if "FTE" not in df.columns:
-        df["FTE"] = 1.0
-
-    # ---- Mapping: IMH 06 -> Business Area ----
-    m2 = load_mapping_sheet2()
-    def _norm(s): 
-        return str(s).strip().lower()
-    imh_candidates = [c for c in df.columns if _norm(c) in ("imh 06","imh l06","imh l 06","imh06")]
-    raw_key_col = imh_candidates[0] if imh_candidates else None
-
-    program_series = None
-    if isinstance(m2, pd.DataFrame) and not m2.empty and raw_key_col:
-        m2_cols = { _norm(c): c for c in m2.columns }
-        key_col = m2_cols.get("imh 06") or m2_cols.get("imh l06") or m2_cols.get("imh06") or list(m2.columns)[0]
-        val_col = (m2_cols.get("business area nomenclature") 
-                   or m2_cols.get("ba nomenclature")
-                   or m2_cols.get("business area")
-                   or list(m2.columns)[-1])
-        look = dict(zip(m2[key_col].astype(str).map(_norm), m2[val_col].astype(str)))
-        program_series = df[raw_key_col].astype(str).map(_norm).map(look)
-
-    if program_series is None:
-        # Fallback to Org Unit / Business Area / constant "All"
-        lower = df.columns.str.lower()
-        if raw_key_col:
-            fallback_series = df[raw_key_col]
-        elif any(lower.isin(["org unit","business area"])):
-            pick_col = df.columns[lower.isin(["org unit","business area"])][0]
-            fallback_series = df[pick_col]
-        else:
-            fallback_series = pd.Series(["All"] * len(df))
-        program_series = fallback_series
-
-    df["program"] = program_series.fillna("All").astype(str)
-
-    # weekly aggregation of leavers FTE by BA/program
-    df["week"] = df["Resignation Date"].apply(lambda x: _week_floor(x, week_start))
-    wk = df.groupby(["week","program"], as_index=False)["FTE"].sum().rename(columns={"FTE":"leavers_fte"})
-
-    # denominator from roster (existing logic)
-    s = load_defaults() or {}
-    wkstart = s.get("week_start","Monday") or week_start
-    den = weekly_avg_active_fte_from_roster(week_start=wkstart)
-
-    out = wk.merge(den, on="week", how="left")
-    out["attrition_pct"] = (out["leavers_fte"] / out["avg_active_fte"].replace({0:np.nan})) * 100.0
-    out["attrition_pct"] = out["attrition_pct"].round(2)
-    keep = ["week","leavers_fte","avg_active_fte","attrition_pct","program"]
-    for k in keep:
-        if k not in out.columns: out[k] = np.nan if k!="program" else "All"
-    return out[keep].sort_values(["week","program"])
-
-
-# Treat any of these values as "leave"
-LEAVE_TOKENS = {"leave","l","off","pto","absent","holiday","al","sl","el"}
-
-def with_is_leave(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure is_leave reflects the current entry/value column."""
-    if df is None or df.empty:
-        return df
-    df = df.copy()
-    valcol = "entry" if "entry" in df.columns else ("value" if "value" in df.columns else None)
-    if valcol is None:
-        return df
-    s = df[valcol].fillna("").astype(str).str.strip().str.lower()
-    df["is_leave"] = s.isin(LEAVE_TOKENS)
-    return df
-
-# ---------------------- UI Fragments ----------------------
+# ---------------------- UI Fragments (left intact) ----------------------
 def header_bar():
     return dbc.Navbar(
         dbc.Container([
             dbc.Button("☰", id="btn-burger-top", color="link", className="me-3", n_clicks=0,
                        style={"fontSize":"24px","textDecoration":"none"}),
-
             html.Span(style={"fontSize":"28px","fontWeight":800}),
-
-            # sticky, dynamic breadcrumb for Planning
             dbc.Breadcrumb(
                 id="ws-breadcrumb",
                 items=[{"label": "Home", "href": "/", "active": True}],
                 className="mb-0 ms-3 flex-grow-1"
             ),
-
             dbc.Nav([ dcc.Link(SYSTEM_NAME, href="/", className="nav-link") ], className="ms-auto"),
         ], fluid=True),
         className="mb-0", sticky="top", style={"backgroundColor":"white"}
@@ -573,19 +1013,17 @@ def page_default_settings():
     return dbc.Container([
         header_bar(),
 
-        # dynamic option stores
-        dcc.Store(id="settings-locations", data=[]),
-        dcc.Store(id="settings-hier-map", data={}),
+        # (Removed Mapping 1 stores/UI completely)
 
         dbc.Card(dbc.CardBody([
             html.H5("Default Settings — Scope"),
             dbc.Row([
-                dbc.Col(dcc.RadioItems(
+                dbc.Col(dbc.RadioItems(
                     id="set-scope",
                     options=[
                         {"label":" Global","value":"global"},
                         {"label":" Location","value":"location"},
-                        {"label":" Business Area ▶ Sub Business Area ▶ LOB","value":"hier"},
+                        {"label":" Business Area ▶ Sub Business Area ▶ Channel","value":"hier"},
                     ],
                     value="global", style={"display": "flex", "gap": "10px"}
                 ), md=12),
@@ -599,7 +1037,7 @@ def page_default_settings():
                 dbc.Col(dbc.Label("Business Area"), md=2),
                 dbc.Col(dcc.Dropdown(id="set-ba", placeholder="Business Area"), md=3),
                 dbc.Col(dcc.Dropdown(id="set-subba", placeholder="Sub Business Area"), md=3),
-                dbc.Col(dcc.Dropdown(id="set-lob", placeholder="LOB / Channel"), md=3),
+                dbc.Col(dcc.Dropdown(id="set-lob", placeholder="Channel"), md=3),
             ], id="row-hier", className="mb-1", style={"display":"none"}),
         ]), className="mb-3"),
 
@@ -637,46 +1075,117 @@ def page_default_settings():
                 html.Span(id="settings-save-msg", className="text-success ms-2")
             ], className="mt-3"),
         ])),
+
+        # ====== CLUBBED TABS: Voice & Back Office only ======
         dbc.Card(dbc.CardBody([
-            html.H5("Mappings"),
-            html.P(
-                "Upload business mappings so reports can show Business Area instead of 'All'. "
-                "Sheet 2 maps Attrition ‘IMH 06’ → Business Area; Sheet 1 is a general catalog "
-                "you may use elsewhere (BA, Sub BA, LOB, Team, Site).",
-                className="text-muted"
+            html.H5("Upload Volume & AHT/SUT (by scope)"),
+            html.Div("Voice uses 30-min intervals; Back Office uses daily totals.", className="text-muted small mb-2"),
+            dbc.Alert("Alert:- Uploads are saved to the selected scope. Even if your file includes Business Area, Sub Business Area, and Channel, please choose the scope above first.",color="light"),
+            dbc.Tabs(id="vol-tabs", children=[
+
+                # ---------- Voice (Forecast + Actual) ----------
+                dcc.Tab(label="Voice", value="tab-voice", children=[
+                    html.H6("Forecast"),
+                    dbc.Row([
+                        dbc.Col(dcc.Upload(
+                            id="up-voice-forecast",
+                            children=html.Div(["⬆️ Upload Voice Forecast (XLSX/CSV)"]),
+                            multiple=False, className="upload-box"
+                        ), md=6),
+                        dbc.Col(dbc.Button("Save Voice Forecast", id="btn-save-voice-forecast", color="primary", className="w-100"), md=3),
+                        dbc.Col(dbc.Button("Download Template", id="btn-dl-voice-forecast-tmpl", outline=True, color="secondary", className="w-100"), md=3),
+                    ], className="my-2"),
+                    dcc.Download(id="dl-voice-forecast-tmpl"),
+                    dash_table.DataTable(
+                        id="tbl-voice-forecast", page_size=10,
+                        style_table={"overflowX":"auto"},
+                        style_as_list_view=True, style_header={"textTransform":"none"}
+                    ),
+                    html.Div(id="voice-forecast-msg", className="text-success mt-1"),
+
+                    html.Hr(),
+                    html.H6("Actual"),
+                    dbc.Row([
+                        dbc.Col(dcc.Upload(
+                            id="up-voice-actual",
+                            children=html.Div(["⬆️ Upload Voice Actual (XLSX/CSV)"]),
+                            multiple=False, className="upload-box"
+                        ), md=6),
+                        dbc.Col(dbc.Button("Save Voice Actual", id="btn-save-voice-actual", color="primary", className="w-100"), md=3),
+                        dbc.Col(dbc.Button("Download Template", id="btn-dl-voice-actual-tmpl", outline=True, color="secondary", className="w-100"), md=3),
+                    ], className="my-2"),
+                    dcc.Download(id="dl-voice-actual-tmpl"),
+                    dash_table.DataTable(
+                        id="tbl-voice-actual", page_size=10,
+                        style_table={"overflowX":"auto"},
+                        style_as_list_view=True, style_header={"textTransform":"none"}
+                    ),
+                    html.Div(id="voice-actual-msg", className="text-success mt-1"),
+                ]),
+
+                # ---------- Back Office (Forecast + Actual) ----------
+                dcc.Tab(label="Back Office", value="tab-bo", children=[
+                    html.H6("Forecast"),
+                    dbc.Row([
+                        dbc.Col(dcc.Upload(
+                            id="up-bo-forecast",
+                            children=html.Div(["⬆️ Upload Back Office Forecast (XLSX/CSV)"]),
+                            multiple=False, className="upload-box"
+                        ), md=6),
+                        dbc.Col(dbc.Button("Save BO Forecast", id="btn-save-bo-forecast", color="primary", className="w-100"), md=3),
+                        dbc.Col(dbc.Button("Download Template", id="btn-dl-bo-forecast-tmpl", outline=True, color="secondary", className="w-100"), md=3),
+                    ], className="my-2"),
+                    dcc.Download(id="dl-bo-forecast-tmpl"),
+                    dash_table.DataTable(
+                        id="tbl-bo-forecast", page_size=10,
+                        style_table={"overflowX":"auto"},
+                        style_as_list_view=True, style_header={"textTransform":"none"}
+                    ),
+                    html.Div(id="bo-forecast-msg", className="text-success mt-1"),
+
+                    html.Hr(),
+                    html.H6("Actual"),
+                    dbc.Row([
+                        dbc.Col(dcc.Upload(
+                            id="up-bo-actual",
+                            children=html.Div(["⬆️ Upload Back Office Actual (XLSX/CSV)"]),
+                            multiple=False, className="upload-box"
+                        ), md=6),
+                        dbc.Col(dbc.Button("Save BO Actual", id="btn-save-bo-actual", color="primary", className="w-100"), md=3),
+                        dbc.Col(dbc.Button("Download Template", id="btn-dl-bo-actual-tmpl", outline=True, color="secondary", className="w-100"), md=3),
+                    ], className="my-2"),
+                    dcc.Download(id="dl-bo-actual-tmpl"),
+                    dash_table.DataTable(
+                        id="tbl-bo-actual", page_size=10,
+                        style_table={"overflowX":"auto"},
+                        style_as_list_view=True, style_header={"textTransform":"none"}
+                    ),
+                    html.Div(id="bo-actual-msg", className="text-success mt-1"),
+                ]),
+            ])
+        ]), className="mb-3"),
+
+        # ===== Headcount upload remains =====
+        dbc.Card(dbc.CardBody([
+            html.H5("Headcount Update — BRID Mapping"),
+            html.Div("Upload the latest headcount file to keep BRID ⇄ Manager/Hierarchy mappings in sync.", className="text-muted small mb-2"),
+
+            dbc.Row([
+                dbc.Col(dcc.Upload(
+                    id="up-headcount",
+                    children=html.Div(["⬆️ Upload Headcount XLSX"]),
+                    multiple=False, className="upload-box"
+                ), md=6),
+                dbc.Col(dbc.Button("Save Headcount", id="btn-save-headcount", color="primary", className="w-100"), md=3),
+                dbc.Col(dbc.Button("Download Template", id="btn-dl-hc-template", outline=True, color="secondary", className="w-100"), md=3),
+            ], className="my-2"),
+            dcc.Download(id="dl-hc-template"),
+            dash_table.DataTable(
+                id="tbl-headcount-preview", page_size=8,
+                style_table={"overflowX":"auto"}, style_as_list_view=True,
+                style_header={"textTransform":"none"}
             ),
-
-            html.H6("Mapping Sheet 1 — Catalog"),
-            dbc.Row([
-                dbc.Col(dcc.Upload(
-                    id="up-map1",
-                    children=html.Div(["⬆️ Upload Mapping Sheet 1 (CSV/XLSX)"]),
-                    multiple=False, className="upload-box"
-                ), md=6),
-                dbc.Col(dbc.Button("Save Mapping 1", id="btn-save-map1", color="primary", className="w-100"), md=3),
-                dbc.Col(dbc.Button("Download Sample", id="btn-dl-map1", outline=True, color="secondary", className="w-100"), md=3),
-            ], className="my-2"),
-            dcc.Download(id="dl-map1"),
-            dash_table.DataTable(id="tbl-map1", page_size=6, style_table={"overflowX":"auto"},
-                                 style_as_list_view=True, style_header={"textTransform":"none"}),
-            html.Div(id="map1-save-msg", className="text-success mt-1"),
-
-            html.Hr(),
-
-            html.H6("Mapping Sheet 2 — IMH 06 → Business Area"),
-            dbc.Row([
-                dbc.Col(dcc.Upload(
-                    id="up-map2",
-                    children=html.Div(["⬆️ Upload Mapping Sheet 2 (CSV/XLSX)"]),
-                    multiple=False, className="upload-box"
-                ), md=6),
-                dbc.Col(dbc.Button("Save Mapping 2", id="btn-save-map2", color="primary", className="w-100"), md=3),
-                dbc.Col(dbc.Button("Download Sample", id="btn-dl-map2", outline=True, color="secondary", className="w-100"), md=3),
-            ], className="my-2"),
-            dcc.Download(id="dl-map2"),
-            dash_table.DataTable(id="tbl-map2", page_size=6, style_table={"overflowX":"auto"},
-                                 style_as_list_view=True, style_header={"textTransform":"none"}),
-            html.Div(id="map2-save-msg", className="text-success mt-1"),
+            html.Div(id="hc-msg", className="text-success mt-1"),
         ]), className="mb-3"),
     ], fluid=True)
 
@@ -691,11 +1200,9 @@ def page_roster():
     return dbc.Container([
         header_bar(),
 
-        # Stores for keeping originals and filtered long
         dcc.Store(id="roster_wide_store", data=(df_wide_db.to_dict("records") if not df_wide_db.empty else [])),
         dcc.Store(id="roster_long_store", data=(df_long_db.to_dict("records") if not df_long_db.empty else [])),
 
-        # ---------------- Template builder + downloads ----------------
         dbc.Card(dbc.CardBody([
             html.H5("Download Roster Template"),
             dbc.Row([
@@ -711,7 +1218,6 @@ def page_roster():
             dcc.Download(id="dl-roster-sample"),
         ]), className="mb-3"),
 
-        # ---------------- Upload + Save ----------------
         dbc.Card(dbc.CardBody([
             html.H5("Upload Filled Roster"),
             dbc.Row([
@@ -733,10 +1239,9 @@ def page_roster():
                 style_as_list_view=True,
                 style_header={"textTransform": "none"},
             ),
-            html.Div(id="roster-wide-msg", className="text-muted mt-1"),  # <-- target for upload status
+            html.Div(id="roster-wide-msg", className="text-muted mt-1"),
         ]), className="mb-3"),
 
-        # ---------------- Normalized view + date filter ----------------
         dbc.Card(dbc.CardBody([
             html.H5("Normalized Schedule Preview"),
             dbc.Row([
@@ -758,7 +1263,6 @@ def page_roster():
             ),
         ]), className="mb-3"),
 
-        # ---------------- Bulk edit helpers (NEW) ----------------
         dbc.Card(dbc.CardBody([
             html.H6("Bulk edit helpers"),
             dbc.Row([
@@ -790,24 +1294,29 @@ def page_new_hire():
     df = load_hiring()
     return dbc.Container([
         header_bar(),
-        dbc.Row([
-            dbc.Col(dcc.Upload(id="up-hire", children=html.Div(["⬆️ Upload CSV/XLSX"]), multiple=False, className="upload-box"), md=4),
-            dbc.Col(dbc.Button("Save", id="btn-save-hire", color="primary"), md=2),
-            dbc.Col(html.Span(id="hire-save-msg", className="text-success"), md=3),
-            dbc.Col(dbc.Button("Download Sample", id="btn-dl-hire", outline=True, color="secondary"), md=3),
-        ], className="my-2"),
-        dcc.Download(id="dl-hire-sample"),
-        dash_table.DataTable(
-            id="tbl-hire",
-            columns=pretty_columns(df if not df.empty else ["start_week","fte","program"]),
-            data=df.to_dict("records"),
-            editable=True, row_deletable=True, page_size=10,
-            style_table={"overflowX":"auto"}, 
-            style_as_list_view=True,
-            style_header={"textTransform": "none"},
-        ),
-        dcc.Graph(id="fig-hire", style={"height":"280px"}, config={"displayModeBar": False}),
+        html.H4("New Hire Summary", className="ghanii"),
+        dbc.Card(dbc.CardBody([
+            dbc.Row([
+                dbc.Col(dcc.Upload(id="up-hire", children=html.Div(["⬆️ Upload XLSX"]), multiple=False, className="upload-box"), md=4),
+                dbc.Col(dbc.Button("Save", id="btn-save-hire", color="primary"), md=2),
+                dbc.Col(html.Span(id="hire-save-msg", className="text-success"), md=3),
+                dbc.Col(dbc.Button("Download Sample", id="btn-dl-hire", outline=True, color="secondary"), md=3),
+            ], className="my-2"),
+            dcc.Download(id="dl-hire-sample"),
+            dash_table.DataTable(
+                id="tbl-hire",
+                columns=pretty_columns(df if not df.empty else ["start_week","fte","program"]),
+                data=df.to_dict("records"),
+                editable=True, row_deletable=True, page_size=10,
+                style_table={"overflowX":"auto"}, 
+                style_as_list_view=True,
+                style_header={"textTransform":"none"},
+            ),
+            dcc.Graph(id="fig-hire", style={"height":"280px"}, config={"displayModeBar": False}),
+        ])),
+        
     ], fluid=True)
+
 
 def page_shrink_attr():
     shr = load_shrinkage()
@@ -816,26 +1325,70 @@ def page_shrink_attr():
         header_bar(),
         dbc.Tabs(id="shr-tabs", active_tab="tab-shrink", children=[
             dbc.Tab(label="Shrinkage", tab_id="tab-shrink", children=[
-                dbc.Row([
-                    dbc.Col(dcc.Upload(id="up-shrink", children=html.Div(["⬆️ Drag & drop or click to upload CSV/XLSX"]), multiple=False, className="upload-box"), md=4),
-                    dbc.Col(dbc.Button("Save", id="btn-save-shrink", color="primary"), md=2),
-                    dbc.Col(html.Span(id="shr-save-msg", className="text-success"), md=3),
-                    dbc.Col(dbc.Button("Download Sample", id="btn-dl-shrink", outline=True, color="secondary"), md=3),
-                ], className="my-2"),
-                dcc.Download(id="dl-shrink-sample"),
-                dash_table.DataTable(
-                    id="tbl-shrink",
-                    columns=pretty_columns(shr if not shr.empty else ["week","shrinkage_pct","program"]),
-                    data=shr.to_dict("records"),
-                    editable=True, row_deletable=True, page_size=10,
-                    style_table={"overflowX":"auto"}, style_as_list_view=True,
-                    style_header={"textTransform": "none"},
-                ),
-                dcc.Graph(id="fig-shrink", style={"height":"280px"}, config={"displayModeBar": False}),
+                # inner tabs: Manual (existing), Back Office (Raw), Voice (Raw)
+                dbc.Tabs(id="shr-inner-tabs", active_tab="inner-manual", children=[
+                    dbc.Tab(label="Weekly Shrink %", tab_id="inner-manual", children=[
+                        dbc.Row([
+                            dbc.Col(dcc.Upload(id="up-shrink", children=html.Div(["⬆️ Drag & drop or click to upload XLSX"]), multiple=False, className="upload-box"), md=4),
+                            dbc.Col(dbc.Button("Save", id="btn-save-shrink", color="primary"), md=2),
+                            dbc.Col(html.Span(id="shr-save-msg", className="text-success"), md=3),
+                            dbc.Col(dbc.Button("Download Sample", id="btn-dl-shrink", outline=True, color="secondary"), md=3),
+                        ], className="my-2"),
+                        dcc.Download(id="dl-shrink-sample"),
+                        dash_table.DataTable(
+                            id="tbl-shrink",
+                            columns=pretty_columns(shr if not shr.empty else ["week","shrinkage_pct","program"]),
+                            data=shr.to_dict("records"),
+                            editable=True, row_deletable=True, page_size=10,
+                            style_table={"overflowX":"auto"}, style_as_list_view=True,
+                            style_header={"textTransform":"none"},
+                        ),
+                        dcc.Graph(id="fig-shrink", style={"height":"280px"}, config={"displayModeBar": False}),
+                    ]),
+
+                    dbc.Tab(label="Back Office — Shrinkage (Raw)", tab_id="inner-bo", children=[
+                        dcc.Store(id="bo-shr-raw-store"),
+                        dbc.Row([
+                            dbc.Col(dcc.Upload(id="up-shr-bo-raw",
+                                               children=html.Div(["⬆️ Upload Back Office Shrinkage (seconds) XLSX/CSV"]),
+                                               multiple=False, className="upload-box"), md=6),
+                            dbc.Col(dbc.Button("Save Back Office Shrinkage", id="btn-save-shr-bo-raw", color="primary", className="w-100"), md=3),
+                            dbc.Col(dbc.Button("Download BO Template", id="btn-dl-shr-bo-template", outline=True, color="secondary", className="w-100"), md=3),
+                        ], className="my-2"),
+                        dcc.Download(id="dl-shr-bo-template"),
+                        html.H6("Uploaded (normalized)"),
+                        dash_table.DataTable(id="tbl-shr-bo-raw", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}),
+                        html.H6("Daily Summary (derived)"),
+                        dash_table.DataTable(id="tbl-shr-bo-sum", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}),
+                        html.Div(id="bo-shr-save-msg", className="text-success mt-2"),
+                    ]),
+
+                    dbc.Tab(label="Voice — Shrinkage (Raw)", tab_id="inner-voice", children=[
+                        dcc.Store(id="voice-shr-raw-store"),
+                        dbc.Row([
+                            dbc.Col(dcc.Upload(id="up-shr-voice-raw",
+                                               children=html.Div(["⬆️ Upload Voice Shrinkage (HH:MM) XLSX/CSV"]),
+                                               multiple=False, className="upload-box"), md=6),
+                            dbc.Col(dbc.Button("Save Voice Shrinkage", id="btn-save-shr-voice-raw", color="primary", className="w-100"), md=3),
+                            dbc.Col(dbc.Button("Download Voice Template", id="btn-dl-shr-voice-template", outline=True, color="secondary", className="w-100"), md=3),
+                        ], className="my-2"),
+                        dcc.Download(id="dl-shr-voice-template"),
+                        html.H6("Uploaded (normalized)"),
+                        dash_table.DataTable(id="tbl-shr-voice-raw", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}),
+                        html.H6("Daily Summary (derived)"),
+                        dash_table.DataTable(id="tbl-shr-voice-sum", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}),
+                        html.Div(id="voice-shr-save-msg", className="text-success mt-2"),
+                    ]),
+                ])
             ]),
+
             dbc.Tab(label="Attrition", tab_id="tab-attr", children=[
                 dbc.Row([
-                    dbc.Col(dcc.Upload(id="up-attr", children=html.Div(["⬆️ Drag & drop or click to upload CSV/XLSX"]), multiple=False, className="upload-box"), md=4),
+                    dbc.Col(dcc.Upload(id="up-attr", children=html.Div(["⬆️ Drag & drop or click to upload XLSX"]), multiple=False, className="upload-box"), md=4),
                     dbc.Col(dbc.Button("Save", id="btn-save-attr", color="primary"), md=2),
                     dbc.Col(html.Span(id="attr-save-msg", className="text-success"), md=3),
                     dbc.Col(dbc.Button("Download Leavers Sample", id="btn-dl-attr", outline=True, color="secondary"), md=3),
@@ -848,12 +1401,99 @@ def page_shrink_attr():
                     data=att.to_dict("records"),
                     editable=True, row_deletable=True, page_size=10,
                     style_table={"overflowX":"auto"}, style_as_list_view=True,
-                    style_header={"textTransform": "none"},
+                    style_header={"textTransform":"none"},
                 ),
                 dcc.Graph(id="fig-attr", style={"height":"280px"}, config={"displayModeBar": False}),
             ]),
         ])
     ], fluid=True)
+
+def page_budget():
+    return dbc.Container([
+        header_bar(),
+        html.H4("Budgets", className="ghanii"),
+        dbc.Card(dbc.CardBody([
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Business Area"),
+                    dcc.Dropdown(id="bud-ba", options=[], placeholder="Select Business Area"),
+                ], md=4),
+                dbc.Col([
+                    html.Label("Sub Business Area"),
+                    dcc.Dropdown(id="bud-subba", options=[], placeholder="Select Sub Business Area"),
+                ], md=4),
+                dbc.Col([
+                    html.Label("Channel"),
+                    dcc.Dropdown(
+                        id="bud-channel",
+                        options=[{"label": c, "value": c} for c in CHANNEL_LIST],
+                        value="Voice",
+                        placeholder="Select Channel"
+                    ),
+                ], md=4),
+            ], className="gy-2 my-1"),
+
+            dbc.Tabs(id="bud-tabs", active_tab="bud-voice", children=[
+
+                # VOICE
+                dbc.Tab(label="Voice budget", tab_id="bud-voice", children=[
+                    dcc.Store(id="store-bud-voice"),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("Start week (Monday)"),
+                            dcc.DatePickerSingle(id="bud-voice-start", display_format="YYYY-MM-DD")
+                        ], md=3),
+                        dbc.Col([
+                            html.Label("Weeks"),
+                            dbc.Input(id="bud-voice-weeks", type="number", value=8, min=1, step=1)
+                        ], md=2),
+                        dbc.Col(dbc.Button("Download Template", id="btn-bud-voice-tmpl", outline=True, className="mt-4"), md=3),
+                        dbc.Col(dcc.Upload(id="up-bud-voice", children=html.Div(["⬆️ Upload CSV/XLSX"]), multiple=False,
+                                        className="upload-box mt-4"), md=4),
+                    ], className="my-2"),
+                    dcc.Download(id="dl-bud-voice"),
+                    dash_table.DataTable(
+                        id="tbl-bud-voice",
+                        page_size=10, editable=True, style_table={"overflowX":"auto"},
+                        style_as_list_view=True, style_header={"textTransform":"none"}
+                    ),
+                    dbc.Row([
+                        dbc.Col(dbc.Button("Save Voice Budget", id="btn-save-bud-voice", color="primary"), md=3),
+                        dbc.Col(html.Span(id="msg-save-bud-voice", className="text-success"), md=9),
+                    ], className="mt-2"),
+                ]),
+
+                # BACK OFFICE
+                dbc.Tab(label="Back Office budget", tab_id="bud-bo", children=[
+                    dcc.Store(id="store-bud-bo"),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("Start week (Monday)"),
+                            dcc.DatePickerSingle(id="bud-bo-start", display_format="YYYY-MM-DD")
+                        ], md=3),
+                        dbc.Col([
+                            html.Label("Weeks"),
+                            dbc.Input(id="bud-bo-weeks", type="number", value=8, min=1, step=1)
+                        ], md=2),
+                        dbc.Col(dbc.Button("Download Template", id="btn-bud-bo-tmpl", outline=True, className="mt-4"), md=3),
+                        dbc.Col(dcc.Upload(id="up-bud-bo", children=html.Div(["⬆️ Upload CSV/XLSX"]), multiple=False,
+                                        className="upload-box mt-4"), md=4),
+                    ], className="my-2"),
+                    dcc.Download(id="dl-bud-bo"),
+                    dash_table.DataTable(
+                        id="tbl-bud-bo",
+                        page_size=10, editable=True, style_table={"overflowX":"auto"},
+                        style_as_list_view=True, style_header={"textTransform":"none"}
+                    ),
+                    dbc.Row([
+                        dbc.Col(dbc.Button("Save Back Office Budget", id="btn-save-bud-bo", color="primary"), md=3),
+                        dbc.Col(html.Span(id="msg-save-bud-bo", className="text-success"), md=9),
+                    ], className="mt-2"),
+                ]),
+            ])
+        ])),        
+    ], fluid=True)
+
 
 def page_dataset():
     roster = load_roster()
@@ -876,7 +1516,401 @@ def page_dataset():
                                  x="date", y=["total_req_fte","supply_fte"], markers=True), className="mt-3"),
     ], fluid=True)
 
-# ---------------------- Sidebar interactions ----------------------
+# ---- Scope option chaining ------------------------------------------------------------------------
+# Fill BA options from Headcount when visiting /budget (and pick the first by default)
+@callback(
+    Output("bud-ba", "options"),
+    Output("bud-ba", "value"),
+    Input("url-router", "pathname"),
+    prevent_initial_call=False
+)
+def _bud_fill_ba(path):
+    bas = _bas_from_headcount()  # from Headcount Update
+    opts = [{"label": b, "value": b} for b in bas]
+    return opts, (bas[0] if bas else None)
+
+# Fill SubBA options when BA changes (from Headcount) & default first
+@callback(
+    Output("bud-subba", "options"),
+    Output("bud-subba", "value"),
+    Input("bud-ba", "value"),
+    prevent_initial_call=False
+)
+def _bud_fill_subba(ba):
+    if not ba:
+        return [], None
+    subs = _sbas_from_headcount(ba)
+    opts = [{"label": s, "value": s} for s in subs]
+    return opts, (subs[0] if subs else None)
+
+# Channel is hardcoded; if you want a default other than Voice, set it here.
+@callback(
+    Output("bud-channel", "options"),
+    Output("bud-channel", "value"),
+    Input("bud-subba", "value"),
+    State("bud-channel", "value"),
+    prevent_initial_call=False
+)
+def _bud_fill_channels(_subba, current):
+    opts = [{"label": c, "value": c} for c in CHANNEL_LIST]
+    # keep existing selection if still valid, else default to "Voice"
+    val = current if current in CHANNEL_LIST else "Voice"
+    return opts, val
+
+
+# ---- Load existing budgets when scope changes ----
+@callback(
+    Output("tbl-bud-voice","data", allow_duplicate=True),
+    Output("tbl-bud-voice","columns", allow_duplicate=True),
+    Output("store-bud-voice","data", allow_duplicate=True),
+    Input("bud-ba","value"), Input("bud-subba","value"), Input("bud-channel","value"),
+    prevent_initial_call=True
+)
+def load_voice_budget(ba, subba, channel):
+    if not (ba and subba and channel): return [], [], None
+    if (channel or "").lower() != "voice":  # still allow loading if user picks voice later
+        return [], [], None
+    key = _scope_key(ba, subba, "Voice")
+    df = load_timeseries("voice_budget", key)
+    if df is None or df.empty:
+        return [], [], None
+    return df.to_dict("records"), pretty_columns(df), df.to_dict("records")
+
+@callback(
+    Output("tbl-bud-bo","data", allow_duplicate=True),
+    Output("tbl-bud-bo","columns", allow_duplicate=True),
+    Output("store-bud-bo","data", allow_duplicate=True),
+    Input("bud-ba","value"), Input("bud-subba","value"), Input("bud-channel","value"),
+    prevent_initial_call=True
+)
+def load_bo_budget(ba, subba, channel):
+    if not (ba and subba and channel): return [], [], None
+    if (channel or "").lower() not in ("back office", "bo"):
+        return [], [], None
+    key = _scope_key(ba, subba, "Back Office")
+    df = load_timeseries("bo_budget", key)
+    if df is None or df.empty:
+        return [], [], None
+    return df.to_dict("records"), pretty_columns(df), df.to_dict("records")
+
+# ---- Download templates ----
+@callback(Output("dl-bud-voice","data"),
+          Input("btn-bud-voice-tmpl","n_clicks"),
+          State("bud-voice-start","date"), State("bud-voice-weeks","value"),
+          prevent_initial_call=True)
+def dl_voice_tmpl(_n, start_date, weeks):
+    df = _budget_voice_template(start_date, int(weeks or 8))
+    return dcc.send_data_frame(df.to_csv, "voice_budget_template.csv", index=False)
+
+@callback(Output("dl-bud-bo","data"),
+          Input("btn-bud-bo-tmpl","n_clicks"),
+          State("bud-bo-start","date"), State("bud-bo-weeks","value"),
+          prevent_initial_call=True)
+def dl_bo_tmpl(_n, start_date, weeks):
+    df = _budget_bo_template(start_date, int(weeks or 8))
+    return dcc.send_data_frame(df.to_csv, "bo_budget_template.csv", index=False)
+
+# ---- Upload / normalize ----
+@callback(
+    Output("tbl-bud-voice","data"),
+    Output("tbl-bud-voice","columns"),
+    Output("store-bud-voice","data"),
+    Input("up-bud-voice","contents"),
+    State("up-bud-voice","filename"),
+    prevent_initial_call=False
+)
+def up_voice(contents, filename):
+    df = parse_upload(contents, filename)
+    dff = _budget_normalize_voice(df)
+    if dff.empty: return [], [], None
+    return dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)), dff.to_dict("records")
+
+@callback(
+    Output("tbl-bud-bo","data"),
+    Output("tbl-bud-bo","columns"),
+    Output("store-bud-bo","data"),
+    Input("up-bud-bo","contents"),
+    State("up-bud-bo","filename"),
+    prevent_initial_call=False
+)
+def up_bo(contents, filename):
+    df = parse_upload(contents, filename)
+    dff = _budget_normalize_bo(df)
+    if dff.empty: return [], [], None
+    return dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)), dff.to_dict("records")
+
+# ---- Save budgets ----
+@callback(
+    Output("msg-save-bud-voice","children"),
+    Input("btn-save-bud-voice","n_clicks"),
+    State("bud-ba","value"), State("bud-subba","value"), State("bud-channel","value"),
+    State("store-bud-voice","data"),
+    prevent_initial_call=True
+)
+def save_voice_budget(_n, ba, subba, channel, store):
+    if not (ba and subba): return "Pick BA & Sub BA."
+    dff = pd.DataFrame(store or [])
+    if dff.empty: return "Nothing to save."
+    key = _canon_scope(ba, subba, "Voice")   # ⬅️ canonical key
+    save_timeseries("voice_budget", key, dff)
+    _save_budget_hc_timeseries(key, dff)     # ⬅️ canonical key in HC mirror
+    aht = dff[["week", "budget_aht_sec"]].rename(columns={"budget_aht_sec":"aht_sec"})
+    save_timeseries("voice_planned_aht", key, aht)
+    return f"Saved Voice budget for {key} ✓  ({len(dff)} rows)."
+
+@callback(
+    Output("msg-save-bud-bo","children"),
+    Input("btn-save-bud-bo","n_clicks"),
+    State("bud-ba","value"), State("bud-subba","value"), State("bud-channel","value"),
+    State("store-bud-bo","data"),
+    prevent_initial_call=True
+)
+def save_bo_budget(_n, ba, subba, channel, store):
+    if not (ba and subba): return "Pick BA & Sub BA."
+    dff = pd.DataFrame(store or [])
+    if dff.empty: return "Nothing to save."
+    key = _canon_scope(ba, subba, "Back Office")  # ⬅️ canonical key
+    save_timeseries("bo_budget", key, dff)
+    _save_budget_hc_timeseries(key, dff)          # ⬅️ canonical key in HC mirror
+    sut = dff[["week", "budget_sut_sec"]].rename(columns={"budget_sut_sec":"sut_sec"})
+    save_timeseries("bo_planned_sut", key, sut)
+    return f"Saved Back Office budget for {key} ✓  ({len(dff)} rows)."
+
+# ---------------------- Download templates (new clubbed) ----------------------
+@callback(Output("dl-voice-forecast-tmpl","data"), Input("btn-dl-voice-forecast-tmpl","n_clicks"), prevent_initial_call=True)
+def dl_voice_fc_tmpl(_n): return dcc.send_data_frame(voice_forecast_template_df().to_csv, "voice_forecast_template.csv", index=False)
+
+@callback(Output("dl-voice-actual-tmpl","data"), Input("btn-dl-voice-actual-tmpl","n_clicks"), prevent_initial_call=True)
+def dl_voice_ac_tmpl(_n): return dcc.send_data_frame(voice_actual_template_df().to_csv, "voice_actual_template.csv", index=False)
+
+@callback(Output("dl-bo-forecast-tmpl","data"), Input("btn-dl-bo-forecast-tmpl","n_clicks"), prevent_initial_call=True)
+def dl_bo_fc_tmpl(_n): return dcc.send_data_frame(bo_forecast_template_df().to_csv, "backoffice_forecast_template.csv", index=False)
+
+@callback(Output("dl-bo-actual-tmpl","data"), Input("btn-dl-bo-actual-tmpl","n_clicks"), prevent_initial_call=True)
+def dl_bo_ac_tmpl(_n): return dcc.send_data_frame(bo_actual_template_df().to_csv, "backoffice_actual_template.csv", index=False)
+
+# ---------------------- Upload previews (clubbed) ----------------------
+@callback(Output("tbl-voice-forecast","data"), Output("tbl-voice-forecast","columns"), Output("voice-forecast-msg","children", allow_duplicate=True),
+          Input("up-voice-forecast","contents"), State("up-voice-forecast","filename"), prevent_initial_call=True)
+def up_voice_forecast(contents, filename):
+    df = parse_upload(contents, filename)
+    if df.empty: return [], [], "Could not read file"
+
+    L = {c.lower(): c for c in df.columns}
+    # Minimal: Date, Interval Start, Volume ; Optional: AHT
+    date_c     = L.get("date")
+    ivl_c      = L.get("interval") or L.get("interval start") or L.get("interval_start")
+    vol_c      = L.get("forecast volume") or L.get("volume")
+    aht_c      = L.get("forecast aht") or L.get("aht")
+
+    if not (date_c and ivl_c and vol_c):
+        return [], [], "Need at least Date, Interval (or Interval Start), and Volume"
+
+    dff = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c], errors="coerce").dt.date.astype(str),
+        "interval": df[ivl_c].map(_coerce_time),
+        "volume": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
+    })
+    if aht_c:
+        dff["aht_sec"] = pd.to_numeric(df[aht_c], errors="coerce").apply(_minutes_to_seconds)
+    else:
+        dff["aht_sec"] = 300.0  # sensible default for missing AHT
+
+    # keep BA/SBA/Channel columns for preview only (saving uses scope)
+    for extra in ["Business Area","Sub Business Area","Channel"]:
+        if extra in df.columns:
+            dff[extra] = df[extra]
+
+    cols = ["date","interval","volume","aht_sec","Business Area","Sub Business Area","Channel"]
+    dff = dff[[c for c in cols if c in dff.columns]]
+
+    return dff.to_dict("records"), pretty_columns(dff), f"Loaded {len(dff)} rows"
+
+@callback(Output("tbl-voice-actual","data"), Output("tbl-voice-actual","columns"), Output("voice-actual-msg","children", allow_duplicate=True),
+          Input("up-voice-actual","contents"), State("up-voice-actual","filename"), prevent_initial_call=True)
+def up_voice_actual(contents, filename):
+    df = parse_upload(contents, filename)
+    if df.empty: return [], [], "Could not read file"
+
+    L = {c.lower(): c for c in df.columns}
+    date_c     = L.get("date")
+    ivl_c      = L.get("interval") or L.get("interval start") or L.get("interval_start")
+    vol_c      = L.get("actual volume") or L.get("volume")
+    aht_c      = L.get("actual aht") or L.get("aht")
+
+    if not (date_c and ivl_c and vol_c):
+        return [], [], "Need at least Date, Interval (or Interval Start), and Volume"
+
+    dff = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c], errors="coerce").dt.date.astype(str),
+        "interval": df[ivl_c].map(_coerce_time),
+        "volume": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
+    })
+    dff["aht_sec"] = pd.to_numeric(df[aht_c], errors="coerce").apply(_minutes_to_seconds) if aht_c else 300.0
+
+    for extra in ["Business Area","Sub Business Area","Channel"]:
+        if extra in df.columns:
+            dff[extra] = df[extra]
+
+    cols = ["date","interval","volume","aht_sec","Business Area","Sub Business Area","Channel"]
+    dff = dff[[c for c in cols if c in dff.columns]]
+
+    return dff.to_dict("records"), pretty_columns(dff), f"Loaded {len(dff)} rows"
+
+@callback(Output("tbl-bo-forecast","data"), Output("tbl-bo-forecast","columns"), Output("bo-forecast-msg","children", allow_duplicate=True),
+          Input("up-bo-forecast","contents"), State("up-bo-forecast","filename"), prevent_initial_call=True)
+def up_bo_forecast(contents, filename):
+    df = parse_upload(contents, filename)
+    if df.empty: return [], [], "Could not read file"
+
+    L = {c.lower(): c for c in df.columns}
+    date_c = L.get("date")
+    vol_c  = L.get("forecast volume") or L.get("volume") or L.get("items")
+    sut_c  = L.get("forecast sut") or L.get("sut") or L.get("durationseconds")
+
+    if not (date_c and vol_c and sut_c):
+        return [], [], "Need Date, Volume/Items and SUT/DurationSeconds"
+
+    dff = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c], errors="coerce").dt.date.astype(str),
+        "items": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
+        "sut_sec": pd.to_numeric(df[sut_c], errors="coerce").fillna(0.0),
+    })
+
+    for extra in ["Business Area","Sub Business Area","Channel"]:
+        if extra in df.columns:
+            dff[extra] = df[extra]
+
+    cols = ["date","items","sut_sec","Business Area","Sub Business Area","Channel"]
+    dff = dff[[c for c in cols if c in dff.columns]]
+
+    return dff.to_dict("records"), pretty_columns(dff), f"Loaded {len(dff)} rows"
+
+@callback(Output("tbl-bo-actual","data"), Output("tbl-bo-actual","columns"), Output("bo-actual-msg","children", allow_duplicate=True),
+          Input("up-bo-actual","contents"), State("up-bo-actual","filename"), prevent_initial_call=True)
+def up_bo_actual(contents, filename):
+    df = parse_upload(contents, filename)
+    if df.empty: return [], [], "Could not read file"
+
+    L = {c.lower(): c for c in df.columns}
+    date_c = L.get("date")
+    vol_c  = L.get("actual volume") or L.get("volume") or L.get("items")
+    sut_c  = L.get("actual sut") or L.get("sut") or L.get("durationseconds")
+
+    if not (date_c and vol_c and sut_c):
+        return [], [], "Need Date, Volume/Items and SUT/DurationSeconds"
+
+    dff = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c], errors="coerce").dt.date.astype(str),
+        "items": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
+        "sut_sec": pd.to_numeric(df[sut_c], errors="coerce").fillna(0.0),
+    })
+
+    for extra in ["Business Area","Sub Business Area","Channel"]:
+        if extra in df.columns:
+            dff[extra] = df[extra]
+
+    cols = ["date","items","sut_sec","Business Area","Sub Business Area","Channel"]
+    dff = dff[[c for c in cols if c in dff.columns]]
+
+    return dff.to_dict("records"), pretty_columns(dff), f"Loaded {len(dff)} rows"
+
+# ---------------------- Save (per-scope, clubbed) ----------------------
+def _scope_guard(scope, ba, sba, lob):
+    if scope != "hier": return False, "Switch scope to Business Area ▶ Sub Business Area ▶ Channel."
+    if not (ba and sba and lob): return False, "Pick BA, Sub BA and Channel first."
+    return True, ""
+
+@callback(Output("voice-forecast-msg","children", allow_duplicate=True),
+          Input("btn-save-voice-forecast","n_clicks"),
+          State("tbl-voice-forecast","data"),
+          State("set-scope","value"), State("set-ba","value"), State("set-subba","value"), State("set-lob","value"),
+          prevent_initial_call=True)
+def save_voice_forecast(_n, preview_rows, scope, ba, sba, ch):
+    ok, msg = _scope_guard(scope, ba, sba, ch)
+    if not ok: return msg
+    sk = _canon_scope(ba, sba, ch)
+    df = pd.DataFrame(preview_rows or [])
+    if df.empty:
+        return 'No rows to save'
+    # Voice forecast/actual: interval-level
+    req_cols = {'date','interval','volume','aht_sec'}
+    if not req_cols.issubset(df.columns):
+        return 'Missing required columns for Voice (date/interval/volume/aht_sec)'
+    vf = df[['date','interval','volume']].copy()
+    af = df[['date','interval','aht_sec']].copy()
+    from cap_store import save_timeseries
+    save_timeseries('voice_forecast_volume', sk, vf)
+    save_timeseries('voice_forecast_aht',    sk, af)
+    return f"Saved VOICE forecast ({len(vf)} intervals) for {sk}"
+
+@callback(Output("voice-actual-msg","children", allow_duplicate=True),
+          Input("btn-save-voice-actual","n_clicks"),
+          State("tbl-voice-actual","data"),
+          State("set-scope","value"), State("set-ba","value"), State("set-subba","value"), State("set-lob","value"),
+          prevent_initial_call=True)
+def save_voice_actual(_n, preview_rows, scope, ba, sba, ch):
+    ok, msg = _scope_guard(scope, ba, sba, ch)
+    if not ok: return msg
+    sk = _canon_scope(ba, sba, ch)
+    df = pd.DataFrame(preview_rows or [])
+    if df.empty:
+        return 'No rows to save'
+    # Voice forecast/actual: interval-level
+    req_cols = {'date','interval','volume','aht_sec'}
+    if not req_cols.issubset(df.columns):
+        return 'Missing required columns for Voice (date/interval/volume/aht_sec)'
+    vf = df[['date','interval','volume']].copy()
+    af = df[['date','interval','aht_sec']].copy()
+    from cap_store import save_timeseries
+    save_timeseries('voice_actual_volume', sk, vf)
+    save_timeseries('voice_actual_aht',    sk, af)
+    return f"Saved VOICE actual ({len(vf)} intervals) for {sk}"
+
+@callback(Output("bo-forecast-msg","children", allow_duplicate=True),
+          Input("btn-save-bo-forecast","n_clicks"),
+          State("tbl-bo-forecast","data"),
+          State("set-scope","value"), State("set-ba","value"), State("set-subba","value"), State("set-lob","value"),
+          prevent_initial_call=True)
+def save_bo_forecast(_n, preview_rows, scope, ba, sba, ch):
+    ok, msg = _scope_guard(scope, ba, sba, ch)
+    if not ok: return msg
+    sk = _canon_scope(ba, sba, ch)
+    df = pd.DataFrame(preview_rows or [])
+    if df.empty:
+        return 'No rows to save'
+    # BO forecast/actual: date-level
+    if 'date' not in df or 'items' not in df or 'sut_sec' not in df:
+        return 'Missing required columns (date/items/sut_sec)'
+    vf = df[['date','items']].rename(columns={'items':'volume'})
+    af = df[['date','sut_sec']].copy()
+    from cap_store import save_timeseries
+    save_timeseries('bo_forecast_volume', sk, vf)
+    save_timeseries('bo_forecast_sut',    sk, af)
+    return f"Saved BO forecast ({len(vf)} days) for {sk}"
+
+@callback(Output("bo-actual-msg","children", allow_duplicate=True),
+          Input("btn-save-bo-actual","n_clicks"),
+          State("tbl-bo-actual","data"),
+          State("set-scope","value"), State("set-ba","value"), State("set-subba","value"), State("set-lob","value"),
+          prevent_initial_call=True)
+def save_bo_actual(_n, preview_rows, scope, ba, sba, ch):
+    ok, msg = _scope_guard(scope, ba, sba, ch)
+    if not ok: return msg
+    sk = _canon_scope(ba, sba, ch)
+    df = pd.DataFrame(preview_rows or [])
+    if df.empty:
+        return 'No rows to save'
+    # BO forecast/actual: date-level
+    if 'date' not in df or 'items' not in df or 'sut_sec' not in df:
+        return 'Missing required columns (date/items/sut_sec)'
+    vf = df[['date','items']].rename(columns={'items':'volume'})
+    af = df[['date','sut_sec']].copy()
+    from cap_store import save_timeseries
+    save_timeseries('bo_actual_volume', sk, vf)
+    save_timeseries('bo_actual_sut',    sk, af)
+    return f"Saved BO actual ({len(vf)} days) for {sk}"
+
 @callback(
     Output("sidebar_collapsed","data"),
     Input("btn-burger-top","n_clicks"),
@@ -895,45 +1929,47 @@ def set_wrapper_class(collapsed):
 def render_sidebar(collapsed):
     return sidebar_component(bool(collapsed)).children
 
-# ---------------------- Settings: dynamic sources ----------------------
+# ---------------------- Settings: Headcount-only dynamic sources ----------------------
+# Populate BA + Location on entering settings
 @callback(
-    Output("settings-locations","data"),
-    Output("settings-hier-map","data"),
+    Output("set-ba","options"),
+    Output("set-ba","value"),
+    Output("set-location","options"),
+    Output("set-location","value"),
     Input("url-router","pathname"),
     prevent_initial_call=False
 )
-def refresh_scope_sources(_path):
-    return get_roster_locations(), get_clients_hierarchy()
+def settings_enter(path):
+    if (path or "").rstrip("/") != "/settings":
+        raise PreventUpdate
+    bas = _bas_from_headcount()
+    locs = _all_locations()
+    ba_val = bas[0] if bas else None
+    loc_val = locs[0] if locs else None
+    return (
+        [{"label": b, "value": b} for b in bas], ba_val,
+        [{"label": l, "value": l} for l in locs], loc_val
+    )
 
-@callback(Output("set-location","options"), Input("settings-locations","data"))
-def fill_locations(locs): return [{"label":x,"value":x} for x in (locs or [])]
-
+# BA → Level 3/Sub BA
 @callback(
-    Output("set-ba","options"), Output("set-ba","value"),
-    Input("settings-hier-map","data"), prevent_initial_call=False
+    Output("set-subba","options"),
+    Output("set-subba","value"),
+    Input("set-ba","value"),
 )
-def fill_ba(hmap):
-    if not hmap: return [], None
-    bas = sorted(hmap.keys())
-    return [{"label":b,"value":b} for b in bas], (bas[0] if bas else None)
+def settings_fill_sba(ba):
+    sbas = _sbas_from_headcount(ba) if ba else []
+    return [{"label": s, "value": s} for s in sbas], (sbas[0] if sbas else None)
 
+# BA+SubBA → LOB/Channel
 @callback(
-    Output("set-subba","options"), Output("set-subba","value"),
-    Input("set-ba","value"), State("settings-hier-map","data")
+    Output("set-lob","options"),
+    Output("set-lob","value"),
+    Input("set-ba","value"), Input("set-subba","value")
 )
-def fill_subba(ba, hmap):
-    if not (ba and hmap and ba in hmap): return [], None
-    subs = sorted((hmap[ba] or {}).keys())
-    return [{"label":s,"value":s} for s in subs], (subs[0] if subs else None)
-
-@callback(
-    Output("set-lob","options"), Output("set-lob","value"),
-    Input("set-ba","value"), Input("set-subba","value"), State("settings-hier-map","data")
-)
-def fill_lob(ba, sub, hmap):
-    if not (ba and sub and hmap and ba in hmap and sub in hmap[ba]): return [], None
-    lobs = hmap[ba][sub]
-    return [{"label":l,"value":l} for l in lobs], (lobs[0] if lobs else None)
+def settings_fill_lob(ba, sba):
+    lobs = _lobs_for_ba_sba(ba, sba) if (ba and sba) else []
+    return [{"label": l, "value": l} for l in lobs], (lobs[0] if lobs else None)
 
 # Show/hide scope rows
 @callback(Output("row-location","style"), Output("row-hier","style"), Input("set-scope","value"))
@@ -941,7 +1977,7 @@ def scope_vis(scope):
     return ({"display":"flex"} if scope=="location" else {"display":"none"},
             {"display":"flex"} if scope=="hier" else {"display":"none"})
 
-# Load settings for the chosen scope/key
+# Load settings for the chosen scope/key (unchanged)
 @callback(
     Output("set-interval","value"),
     Output("set-hours","value"),
@@ -968,7 +2004,6 @@ def load_for_scope(scope, loc, ba, subba, lob):
     else:
         s = load_defaults()
         note = "Scope: Global defaults"
-
     s = (s or DEFAULT_SETTINGS)
 
     return (
@@ -983,7 +2018,7 @@ def load_for_scope(scope, loc, ba, subba, lob):
         note,
     )
 
-# Save per-scope
+# Save per-scope (unchanged)
 @callback(
     Output("settings-save-msg","children"),
     Input("btn-save-settings","n_clicks"),
@@ -1017,7 +2052,62 @@ def save_scoped(n, scope, loc, ba, subba, lob, ivl, hrs, shr, sl, slsec, occ, ut
         save_scoped_settings("hier", key, payload); return f"Saved for {ba} › {subba} › {lob} ✓"
     return ""
 
-# ---------------------- Roster ----------------------
+# ---------------------- Roster (unchanged) ----------------------
+def build_roster_template_wide(start_date: dt.date, end_date: dt.date, include_sample: bool = False) -> pd.DataFrame:
+    base_cols = [
+        "BRID", "Name", "Team Manager",
+        "Business Area", "Sub Business Area", "LOB",
+        "Site", "Location", "Country"
+    ]
+    if not isinstance(start_date, dt.date):
+        start_date = pd.to_datetime(start_date).date()
+    if not isinstance(end_date, dt.date):
+        end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    date_cols = [(start_date + dt.timedelta(days=i)).isoformat()
+                 for i in range((end_date - start_date).days + 1)]
+    cols = base_cols + date_cols
+    df = pd.DataFrame(columns=cols)
+
+    if include_sample and date_cols:
+        r1 = {c: "" for c in cols}
+        r1.update({
+            "BRID": "IN0001", "Name": "Asha Rao", "Team Manager": "Priyanka Menon",
+            "Business Area": "Retail", "Sub Business Area": "Cards", "LOB": "Back Office",
+            "Site": "Chennai", "Location": "IN-Chennai", "Country": "India",
+            date_cols[0]: "09:00-17:30"
+        })
+        r2 = {c: "" for c in cols}
+        r2.update({
+            "BRID": "UK0002", "Name": "Alex Doe", "Team Manager": "Chris Lee",
+            "Business Area": "Retail", "Sub Business Area": "Cards", "LOB": "Voice",
+            "Site": "Glasgow", "Location": "UK-Glasgow", "Country": "UK",
+            date_cols[0]: "Leave"
+        })
+        if len(date_cols) > 1:
+            r1[date_cols[1]] = "10:00-18:00"
+        df = pd.DataFrame([r1, r2])[cols]
+    return df
+
+def normalize_roster_wide(df_wide: pd.DataFrame) -> pd.DataFrame:
+    if df_wide is None or df_wide.empty:
+        return pd.DataFrame(columns=[
+            "BRID","Name","Team Manager","Business Area","Sub Business Area",
+            "LOB","Site","Location","Country","date","entry"
+        ])
+    id_cols = ["BRID","Name","Team Manager","Business Area","Sub Business Area","LOB","Site","Location","Country"]
+    id_cols = [c for c in id_cols if c in df_wide.columns]
+    date_cols = [c for c in df_wide.columns if c not in id_cols]
+    long = df_wide.melt(id_vars=id_cols, value_vars=date_cols, var_name="date", value_name="entry")
+    long["entry"] = long["entry"].fillna("").astype(str).str.strip()
+    long = long[long["entry"] != ""]
+    long["date"] = pd.to_datetime(long["date"], errors="coerce", dayfirst=True).dt.date
+    long = long[pd.notna(long["date"])]
+    long["is_leave"] = long["entry"].str.lower().isin({"leave","l","off","pto"})
+    return long
+
 @callback(
     Output("dl-roster-template","data"),
     Input("btn-dl-roster-template","n_clicks"),
@@ -1029,7 +2119,6 @@ def dl_roster_tmpl(n, sd, ed):
     df = build_roster_template_wide(sd, ed, include_sample=False)
     s, e = pd.to_datetime(sd).date(), pd.to_datetime(ed).date()
     return dcc.send_data_frame(df.to_csv, f"roster_template_{s}_{e}.csv", index=False)
-
 
 @callback(
     Output("dl-roster-sample","data"),
@@ -1059,7 +2148,8 @@ def on_upload_roster(contents, filename):
     df = parse_upload(contents, filename)
     if df.empty:
         raise PreventUpdate
-    long = with_is_leave(normalize_roster_wide(df))
+    df = enrich_with_manager(df)
+    long = normalize_roster_wide(df)
     msg = f"Loaded {len(df)} rows. Normalized rows: {len(long)}."
     return (
         df.to_dict("records"), pretty_columns(df), df.to_dict("records"),
@@ -1084,7 +2174,7 @@ def filter_long_for_preview(sd, ed, store):
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"]).dt.date
         df = df[(df["date"] >= sd) & (df["date"] <= ed)]
-    df = with_is_leave(df)
+    df["is_leave"] = df.get("entry","").astype(str).str.lower().isin({"leave","l","off","pto"})
     return df.to_dict("records")
 
 @callback(
@@ -1097,7 +2187,8 @@ def filter_long_for_preview(sd, ed, store):
 def save_roster_wide_and_long(n, rows_wide, rows_long):
     dfw = pd.DataFrame(rows_wide or [])
     dfl = pd.DataFrame(rows_long or [])
-    dfl = with_is_leave(dfl)
+    dfw = enrich_with_manager(dfw)
+    dfl = enrich_with_manager(dfl)
     save_roster_wide(dfw)
     save_roster_long(dfl)
     return "Saved ✓ (wide + normalized)"
@@ -1142,7 +2233,6 @@ def apply_bulk_clear(n, rows, start, end, brids, action):
         raise PreventUpdate
 
     mask = (date_ser >= pd.to_datetime(start).date()) & (date_ser <= pd.to_datetime(end).date())
-
     brid_col = "BRID" if "BRID" in df.columns else ("brid" if "brid" in df.columns else None)
     if brids and brid_col:
         mask &= df[brid_col].astype(str).isin([str(b) for b in brids])
@@ -1158,11 +2248,11 @@ def apply_bulk_clear(n, rows, start, end, brids, action):
         df.loc[mask, target_col] = action
         msg = f"Set '{action}' on {edits} cells."
 
-    df = with_is_leave(df)
+    df["is_leave"] = df[target_col].astype(str).str.lower().isin({"leave","l","off","pto"})
     updated = df.to_dict("records")
     return updated, updated, msg
 
-# ---------------------- New Hire ----------------------
+# ---------------------- New Hire / Shrinkage / Attrition (unchanged) ----------------------
 @callback(
     Output("tbl-hire","data"), Output("tbl-hire","columns"),
     Output("hire-save-msg","children"), Output("fig-hire","figure"),
@@ -1183,7 +2273,6 @@ def hire_upload_save(contents, filename, n, rows):
     fig = px.bar(df, x="start_week", y="fte", color=("program" if "program" in df.columns else None), title="Hiring by Week") if not df.empty else {}
     return rows, pretty_columns(df if not df.empty else []), "Saved ✓", fig
 
-# ---------------------- Shrinkage ----------------------
 @callback(
     Output("tbl-shrink","data"), Output("tbl-shrink","columns"),
     Input("up-shrink","contents"), State("up-shrink","filename"),
@@ -1207,7 +2296,120 @@ def shrink_save(n, rows):
         return "Saved ✓", fig
     return "Saved ✓ (empty)", {}
 
-# ---------------------- Attrition (raw → weekly %) ----------------------
+def _week_floor(d: pd.Timestamp | str | dt.date, week_start: str = "Monday") -> dt.date:
+    d = pd.to_datetime(d).date()
+    wd = d.weekday()
+    if (week_start or "Monday").lower().startswith("sun"):
+        return d - dt.timedelta(days=(wd + 1) % 7)
+    return d - dt.timedelta(days=wd)
+
+def weekly_avg_active_fte_from_roster(week_start: str = "Monday") -> pd.DataFrame:
+    roster = load_roster()
+    if isinstance(roster, pd.DataFrame) and (not roster.empty) and {"start_date","fte"}.issubset(roster.columns):
+        def _to_date(x):
+            try: return pd.to_datetime(x).date()
+            except Exception: return None
+        r = roster.copy()
+        r["sd"] = r["start_date"].apply(_to_date)
+        r["ed"] = (r["end_date"] if "end_date" in r.columns else pd.Series([None]*len(r))).apply(_to_date)
+        sd_min = min([d for d in r["sd"].dropna()] or [dt.date.today()])
+        ed_max = max([d for d in r["ed"].dropna()] or [dt.date.today() + dt.timedelta(days=180)])
+        if ed_max < sd_min: ed_max = sd_min + dt.timedelta(days=180)
+        days = pd.date_range(sd_min, ed_max, freq="D").date
+        rows = []
+        for _, row in r.iterrows():
+            sd = row["sd"] or sd_min
+            ed = row["ed"] or ed_max
+            fte = float(row.get("fte", 0) or 0)
+            if fte <= 0: continue
+            start, end = max(sd, sd_min), min(ed, ed_max)
+            for d in days:
+                if start <= d <= end:
+                    rows.append({"date": d, "fte": fte})
+        if not rows:
+            return pd.DataFrame(columns=["week","avg_active_fte"])
+        daily = pd.DataFrame(rows).groupby("date", as_index=False)["fte"].sum()
+        daily["week"] = daily["date"].apply(lambda x: _week_floor(x, week_start))
+        weekly = daily.groupby("week", as_index=False)["fte"].mean().rename(columns={"fte":"avg_active_fte"})
+        return weekly.sort_values("week")
+
+    try:
+        long = load_roster_long()
+    except Exception:
+        long = None
+    if long is None or long.empty or "date" not in long.columns:
+        return pd.DataFrame(columns=["week","avg_active_fte"])
+    df = long.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df.dropna(subset=["date"])
+    id_col = "BRID" if "BRID" in df.columns else ("employee_id" if "employee_id" in df.columns else None)
+    if not id_col:
+        return pd.DataFrame(columns=["week","avg_active_fte"])
+    daily = df.groupby(["date"], as_index=False)[id_col].nunique().rename(columns={id_col:"fte"})
+    daily["week"] = daily["date"].apply(lambda x: _week_floor(x, week_start))
+    weekly = daily.groupby("week", as_index=False)["fte"].mean().rename(columns={"fte":"avg_active_fte"})
+    return weekly.sort_values("week")
+
+def attrition_weekly_from_raw(df_raw: pd.DataFrame, week_start: str = "Monday") -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(columns=["week","leavers_fte","avg_active_fte","attrition_pct","program"])
+    df = df_raw.copy()
+    if "Resignation Date" not in df.columns:
+        if "Reporting Full Date" in df.columns:
+            df["Resignation Date"] = df["Reporting Full Date"]
+        else:
+            return pd.DataFrame(columns=["week","leavers_fte","avg_active_fte","attrition_pct","program"])
+    df = df[~df["Resignation Date"].isna()].copy()
+    if "FTE" not in df.columns:
+        df["FTE"] = 1.0
+
+    program_series = None
+    try:
+        hc = load_headcount()
+    except Exception:
+        hc = pd.DataFrame()
+
+    if "BRID" in df.columns and isinstance(hc, pd.DataFrame) and not hc.empty and "journey" in hc.columns:
+        map_brid_to_j = dict(zip(hc["brid"].astype(str), hc["journey"].astype(str)))
+        program_series = df["BRID"].astype(str).map(lambda x: map_brid_to_j.get(x))
+
+    if program_series is None or program_series.isna().all():
+        raw_l2_col = None
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if cl in ("imh 06","imh l06","imh l 06","imh06","level 2","level_2"):
+                raw_l2_col = c
+                break
+        if raw_l2_col is not None:
+            try:
+                l2_map = level2_to_journey_map()
+            except Exception:
+                l2_map = {}
+            if l2_map:
+                program_series = df[raw_l2_col].astype(str).map(lambda x: l2_map.get(str(x).strip()))
+
+    if program_series is None:
+        lower = df.columns.str.lower()
+        if any(lower.isin(["org unit","business area","journey"])):
+            pick_col = df.columns[lower.isin(["org unit","business area","journey"])][0]
+            program_series = df[pick_col]
+        else:
+            program_series = pd.Series(["All"] * len(df))
+
+    df["program"] = program_series.fillna("All").astype(str)
+    df["week"] = df["Resignation Date"].apply(lambda x: _week_floor(x, week_start))
+    wk = df.groupby(["week","program"], as_index=False)["FTE"].sum().rename(columns={"FTE":"leavers_fte"})
+    s = load_defaults() or {}
+    wkstart = s.get("week_start","Monday") or week_start
+    den = weekly_avg_active_fte_from_roster(week_start=wkstart)
+    out = wk.merge(den, on="week", how="left")
+    out["attrition_pct"] = (out["leavers_fte"] / out["avg_active_fte"].replace({0:np.nan})) * 100.0
+    out["attrition_pct"] = out["attrition_pct"].round(2)
+    keep = ["week","leavers_fte","avg_active_fte","attrition_pct","program"]
+    for k in keep:
+        if k not in out.columns: out[k] = np.nan if k!="program" else "All"
+    return out[keep].sort_values(["week","program"])
+
 @callback(
     Output("tbl-attr","data", allow_duplicate=True),
     Output("tbl-attr","columns", allow_duplicate=True),
@@ -1219,14 +2421,12 @@ def shrink_save(n, rows):
 def attr_upload(contents, filename):
     df = parse_upload(contents, filename)
     if df.empty: raise PreventUpdate
-
     looks_raw = ("Resignation Date" in df.columns) or ("Reporting Full Date" in df.columns)
     if looks_raw:
         s = load_defaults() or {}
         wkstart = s.get("week_start","Monday")
         wk = attrition_weekly_from_raw(df, week_start=wkstart)
         return wk.to_dict("records"), pretty_columns(wk), df.to_dict("records")
-
     return df.to_dict("records"), pretty_columns(df), None
 
 @callback(
@@ -1268,67 +2468,185 @@ def attr_save(n, rows, raw_store):
                   markers=True, title="Attrition %")
     return f"Saved ✓{raw_msg}", fig
 
-# ---------------------- Mapping Callbacks ----------------
-
-# ---------- Mapping Sheet 1 ----------
-@callback(
-    Output("tbl-map1","data"), Output("tbl-map1","columns"),
-    Input("up-map1","contents"), State("up-map1","filename"),
+# 1) Sample template (static columns you expect from leavers file)
+@app.callback(
+    Output("dl-attr-sample", "data"),
+    Input("btn-dl-attr", "n_clicks"),
     prevent_initial_call=True
 )
-def map1_upload(contents, filename):
+def download_leavers_sample(n):
+    if not n:
+        raise PreventUpdate
+
+    cols = [
+        "Reporting Full Date","BRID","Employee Name","Operational Status",
+        "Corporate Grade Description","Employee Email Address","Employee Position",
+        "Position Description","Employee Line Manager Indicator","Length of Service Date",
+        "Cost Centre","Line Manager BRID","Line Manager Name","IMH L05","IMH L06",
+        "Employee Line Manager lvl 01","Employee Line Manager lvl 02","Employee Line Manager lvl 03",
+        "Employee Line Manager lvl 04","Employee Line Manager lvl 05","Employee Line Manager lvl 06",
+        "Employee Line Manager lvl 07","Employee Line Manager lvl 08","Employee Line Manager lvl 09",
+        "City","Building","Gender Description","Voluntary Involuntary Exit Description",
+        "Resignation Date","Employee Contract","HC","HC FTE"
+    ]
+
+    df = pd.DataFrame(columns=cols)
+    return dcc.send_data_frame(df.to_csv, "leavers_sample.csv", index=False)
+
+# 2) Raw (whatever the user uploaded and you stored in attr_raw_store)
+@app.callback(
+    Output("dl-attr-raw", "data"),
+    Input("btn-dl-attr-raw", "n_clicks"),
+    State("attr_raw_store", "data"),
+    prevent_initial_call=True
+)
+def dl_attr_raw(_n, raw):
+    df = pd.DataFrame(raw or [])
+    if df.empty: raise dash.exceptions.PreventUpdate
+    return dcc.send_data_frame(df.to_csv, "attrition_raw.csv", index=False)
+
+
+# ---------------------- Headcount upload/preview/save ----------------------
+@callback(
+    Output("tbl-headcount-preview","data"),
+    Output("tbl-headcount-preview","columns"),
+    Output("hc-msg","children"),
+    Input("up-headcount","contents"),
+    State("up-headcount","filename"),
+    prevent_initial_call=False
+)
+def hc_preview(contents, filename):
     df = parse_upload(contents, filename)
-    if df.empty: raise PreventUpdate
-    return df.to_dict("records"), pretty_columns(df)
+    if df is None or df.empty:
+        return [], [], ""
+    wanted = ["BRID","Full Name","Line Manager BRID","Line Manager Full Name",
+              "Business Area","Sub Business Area","LOB","Site","Location"]
+    cols = [c for c in df.columns if str(c).strip() in wanted] or list(df.columns)[:12]
+    dff = df[cols].copy()
+    return dff.to_dict("records"), pretty_columns(dff), f"Preview loaded: {len(df)} rows"
 
 @callback(
-    Output("map1-save-msg","children"),
-    Input("btn-save-map1","n_clicks"),
-    State("tbl-map1","data"),
+    Output("hc-msg","children", allow_duplicate=True),
+    Input("btn-save-headcount","n_clicks"),
+    State("up-headcount","contents"),
+    State("up-headcount","filename"),
     prevent_initial_call=True
 )
-def map1_save(n, rows):
-    df = pd.DataFrame(rows or [])
-    if df.empty: return "Nothing to save."
-    save_mapping_sheet1(df)
-    return "Mapping Sheet 1 saved ✓"
-
-@callback(Output("dl-map1","data"), Input("btn-dl-map1","n_clicks"), prevent_initial_call=True)
-def dl_map1(n):
-    df = mapping_sheet1_template_df()
-    return dcc.send_data_frame(df.to_csv, "mapping_sheet1_template.csv", index=False)
-
-# ---------- Mapping Sheet 2 ----------
-@callback(
-    Output("tbl-map2","data"), Output("tbl-map2","columns"),
-    Input("up-map2","contents"), State("up-map2","filename"),
-    prevent_initial_call=True
-)
-def map2_upload(contents, filename):
+def hc_save(n, contents, filename):
+    if not n:
+        raise PreventUpdate
     df = parse_upload(contents, filename)
-    if df.empty: raise PreventUpdate
-    return df.to_dict("records"), pretty_columns(df)
+    if df is None or df.empty:
+        return "No data to save."
+    try:
+        from cap_store import save_headcount_df
+        count = save_headcount_df(df)
+        return f"Saved headcount: {count} rows."
+    except Exception as e:
+        return f"Error saving headcount: {e}"
 
+@callback(Output("dl-hc-template","data"),
+          Input("btn-dl-hc-template","n_clicks"),
+          prevent_initial_call=True)
+def dl_hc_tmpl(_n):
+    return dcc.send_data_frame(headcount_template_df().to_csv, "headcount_template.csv", index=False)
+
+# === Shrinkage RAW: Download templates ===
+@callback(Output("dl-shr-bo-template","data"),
+          Input("btn-dl-shr-bo-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_bo_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_bo_raw_template_df().to_csv, "shrinkage_backoffice_raw_template.csv", index=False)
+
+@callback(Output("dl-shr-voice-template","data"),
+          Input("btn-dl-shr-voice-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_voice_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_voice_raw_template_df().to_csv, "shrinkage_voice_raw_template.csv", index=False)
+
+# === Shrinkage RAW: Upload/preview/summary (Back Office) ===
 @callback(
-    Output("map2-save-msg","children"),
-    Input("btn-save-map2","n_clicks"),
-    State("tbl-map2","data"),
+    Output("tbl-shr-bo-raw","data"),
+    Output("tbl-shr-bo-raw","columns"),
+    Output("tbl-shr-bo-sum","data"),
+    Output("tbl-shr-bo-sum","columns"),
+    Output("bo-shr-raw-store","data"),
+    Input("up-shr-bo-raw","contents"),
+    State("up-shr-bo-raw","filename"),
     prevent_initial_call=True
 )
-def map2_save(n, rows):
-    df = pd.DataFrame(rows or [])
-    if df.empty: return "Nothing to save."
-    save_mapping_sheet2(df)
-    return "Mapping Sheet 2 saved ✓"
+def up_shr_bo(contents, filename):
+    df = parse_upload(contents, filename)
+    dff = normalize_shrinkage_bo(df)
+    if dff.empty:
+        return [], [], [], [], None
+    summ = summarize_shrinkage_bo(dff)
+    return (
+        dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(pretty_columns(summ)),
+        dff.to_dict("records")
+    )
 
-@callback(Output("dl-map2","data"), Input("btn-dl-map2","n_clicks"), prevent_initial_call=True)
-def dl_map2(n):
-    df = mapping_sheet2_template_df()
-    return dcc.send_data_frame(df.to_csv, "mapping_sheet2_template.csv", index=False)
+@callback(
+    Output("bo-shr-save-msg","children"),
+    Input("btn-save-shr-bo-raw","n_clicks"),
+    State("bo-shr-raw-store","data"),
+    prevent_initial_call=True
+)
+def save_shr_bo(_n, store):
+    dff = pd.DataFrame(store or [])
+    if dff.empty: return "Nothing to save."
+    # Save raw
+    save_df("shrinkage_raw_backoffice", dff)
+    # Also compute + save weekly % (to keep your existing shrinkage chart working)
+    daily = summarize_shrinkage_bo(dff)
+    weekly = weekly_shrinkage_from_bo_summary(daily)
+    base = load_shrinkage()
+    merged = pd.concat([base, weekly], ignore_index=True) if isinstance(base, pd.DataFrame) and not base.empty else weekly
+    save_shrinkage(merged)
+    return f"Saved Back Office shrinkage ✓  (raw rows: {len(dff)}, weekly points: {len(weekly)})"
+
+# === Shrinkage RAW: Upload/preview/summary (Voice) ===
+@callback(
+    Output("tbl-shr-voice-raw","data"),
+    Output("tbl-shr-voice-raw","columns"),
+    Output("tbl-shr-voice-sum","data"),
+    Output("tbl-shr-voice-sum","columns"),
+    Output("voice-shr-raw-store","data"),
+    Input("up-shr-voice-raw","contents"),
+    State("up-shr-voice-raw","filename"),
+    prevent_initial_call=True
+)
+def up_shr_voice(contents, filename):
+    df = parse_upload(contents, filename)
+    dff = normalize_shrinkage_voice(df)
+    if dff.empty:
+        return [], [], [], [], None
+    summ = summarize_shrinkage_voice(dff)
+    return (
+        dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(pretty_columns(summ)),
+        dff.to_dict("records")
+    )
+
+@callback(
+    Output("voice-shr-save-msg","children"),
+    Input("btn-save-shr-voice-raw","n_clicks"),
+    State("voice-shr-raw-store","data"),
+    prevent_initial_call=True
+)
+def save_shr_voice(_n, store):
+    dff = pd.DataFrame(store or [])
+    if dff.empty: return "Nothing to save."
+    # Save raw
+    save_df("shrinkage_raw_voice", dff)
+    # Weekly % into main shrinkage series (program = Business Area)
+    daily = summarize_shrinkage_voice(dff)
+    weekly = weekly_shrinkage_from_voice_summary(daily)
+    base = load_shrinkage()
+    merged = pd.concat([base, weekly], ignore_index=True) if isinstance(base, pd.DataFrame) and not base.empty else weekly
+    save_shrinkage(merged)
+    return f"Saved Voice shrinkage ✓  (raw rows: {len(dff)}, weekly points: {len(weekly)})"
 
 # ---------------------- Router + Home ----------------------
-app.layout.children.append(dcc.Interval(id="cap-plans-refresh", interval=5000, n_intervals=0))
-
 @callback(
     Output("tbl-projects", "data"),
     Input("cap-plans-refresh", "n_intervals"),
@@ -1337,7 +2655,7 @@ app.layout.children.append(dcc.Interval(id="cap-plans-refresh", interval=5000, n
 )
 def _refresh_projects_table(_n, pathname):
     path = (pathname or "").rstrip("/")
-    if path not in ("", "/"):  # only refresh on Home
+    if path not in ("", "/"):
         raise PreventUpdate
     df = make_projects_sample()
     return df.to_dict("records")
@@ -1359,13 +2677,11 @@ def not_found_layout():
 def route(pathname: str):
     path = (pathname or "").rstrip("/")
 
-    # --- NEW: Plan detail route (must come before pages dict lookup) ---
     if path.startswith("/plan/"):
         try:
             pid = int(path.rsplit("/", 1)[-1])
         except Exception:
             return not_found_layout()
-        # wrap with your shared header
         return dbc.Container([header_bar(), layout_for_plan(pid)], fluid=True)
 
     if path in ("/", None, ""):
@@ -1379,12 +2695,12 @@ def route(pathname: str):
         "/dataset":  page_dataset,
         "/planning": lambda: dbc.Container([header_bar(), planning_layout()], fluid=True),
         "/ops":      lambda: dbc.Container([header_bar(), dbc.Alert("Operational Dashboard — todo", color="info")], fluid=True),
-        "/budget":   lambda: dbc.Container([header_bar(), dbc.Alert("Budget — todo", color="info")], fluid=True),
+        "/budget":   page_budget,
     }
     fn = pages.get(path)
     return fn() if fn else not_found_layout()
 
-# ✅ VALIDATION LAYOUT — add the plan-detail skeleton so Dash “knows” the IDs
+# ✅ VALIDATION LAYOUT — include plan-detail skeleton
 app.validation_layout = html.Div([
     dcc.Location(id="url-router"),
     dcc.Store(id="sidebar_collapsed"),
@@ -1392,14 +2708,15 @@ app.validation_layout = html.Div([
     dcc.Store(id="ws-selected-ba"),
     dcc.Store(id="ws-refresh"),
     header_bar(),
-    planning_layout(),                  # existing planning skeleton
-    plan_detail_validation_layout(),    # ← NEW: tiny, hidden layout for /plan/<id>
+    planning_layout(),
+    plan_detail_validation_layout(),
     dash_table.DataTable(id="tbl-projects"),
 ])
 
 # Register callbacks (planning + plan-detail)
 register_planning_ws(app)
-register_plan_detail(app)  # ← keep this after app.validation_layout is set
+register_plan_detail(app)
+
 # ---------------------- Main ----------------------
 if __name__ == "__main__":
     app.run(debug=True)
