@@ -2205,6 +2205,64 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual");  vT = _assemble_voice(sk, "tactical")
     bF = _assemble_bo(sk,   "forecast"); bA = _assemble_bo(sk,   "actual");    bT = _assemble_bo(sk,   "tactical")
 
+    # ---------- Budget AHT/SUT (weekly) overrides from Budget page (Option A) ----------
+    def _budget_aht_sut_overrides(sk: str, which: str) -> Dict[str, float]:
+        """
+        Read Budget-page uploads (weekly AHT/SUT) for the scope_key `sk`.
+        Returns {week_iso: seconds}. `which` in {"voice","bo"}.
+        Accepts tolerant column names and optional volume weighting.
+        """
+        keys_voice = [
+            "budget_voice_aht","budget_aht_voice","budget_aht_sut_voice",
+            "budget_settings_voice","budgeted_aht_voice"
+        ]
+        keys_bo = [
+            "budget_bo_sut","budget_sut_bo","budget_aht_sut_bo",
+            "budget_settings_bo","budgeted_sut_bo"
+        ]
+        df = _first_non_empty_ts(sk, keys_voice if which.lower()=="voice" else keys_bo)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+        d = df.copy()
+        L = {str(c).strip().lower(): c for c in d.columns}
+        c_date = L.get("date") or L.get("week") or L.get("start_date")
+        c_time = (L.get("aht_sec") or L.get("aht") or L.get("avg_aht") or
+                  L.get("sut_sec") or L.get("sut") or L.get("avg_sut"))
+        if not c_date or not c_time:
+            return {}
+        d[c_date] = pd.to_datetime(d[c_date], errors="coerce")
+        d = d.dropna(subset=[c_date])
+        d["week"] = (d[c_date] - pd.to_timedelta(d[c_date].dt.weekday, unit="D")).dt.date.astype(str)
+        d[c_time] = pd.to_numeric(d[c_time], errors="coerce").fillna(0.0)
+
+        c_vol = L.get("vol") or L.get("volume") or L.get("calls") or L.get("items") or L.get("txns")
+        if c_vol and c_vol in d.columns:
+            d[c_vol] = pd.to_numeric(d[c_vol], errors="coerce").fillna(0.0)
+            d["_num_"] = d[c_time] * d[c_vol]
+            g = d.groupby("week", as_index=False)[["_num_", c_vol]].sum()
+            g["_wt_"] = np.where(g[c_vol] > 0, g["_num_"] / g[c_vol], np.nan)
+            m = g.set_index("week")["_wt_"]
+        else:
+            m = d.groupby("week", as_index=False)[c_time].mean().set_index("week")[c_time]
+
+        return {k: float(v) for k, v in m.dropna().to_dict().items() if v > 0}
+
+    def _apply_weekly_override(df: pd.DataFrame, week_map: Dict[str, float], time_col="aht_sec"):
+        """Apply a {week: seconds} override to a daily DF with a 'date' column."""
+        if not isinstance(df, pd.DataFrame) or df.empty or not week_map:
+            return df
+        x = df.copy()
+        dts = pd.to_datetime(x["date"], errors="coerce")
+        x["week"] = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date.astype(str)
+        x["_ovr"] = x["week"].map(week_map)
+        if time_col not in x.columns:
+            x[time_col] = 0.0
+        # prefer weekly override if present and positive
+        base = pd.to_numeric(x[time_col], errors="coerce").fillna(0.0)
+        x[time_col] = np.where(pd.notna(x["_ovr"]) & (x["_ovr"] > 0), x["_ovr"], base)
+        return x.drop(columns=["week","_ovr"])
+    # ---------------------------------------------------------------------------
+
     # Fallback for requirements if actuals missing
     use_voice_for_req = vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF
     use_bo_for_req    = bA if isinstance(bA, pd.DataFrame) and not bA.empty else bF
@@ -2277,9 +2335,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
 
     # demand used for SL
     weekly_demand_voice, weekly_demand_bo = {}, {}
-    # Build settings overrides (if any)
+
+    # Settings-page forecast overrides (already existing)
     voice_ovr = _settings_volume_aht_overrides(sk, "voice")
     bo_ovr    = _settings_volume_aht_overrides(sk, "bo")
+
+    # NEW: Budget weekly overrides dicts (Option A)
+    budget_voice_w = _budget_aht_sut_overrides(sk, "voice")  # {week: aht_sec}
+    budget_bo_w    = _budget_aht_sut_overrides(sk, "bo")     # {week: sut_sec}
+
     for w in week_ids:
         f_voice = _get(vF_w, w, v_vol_col_F, 0.0) if v_vol_col_F else 0.0
         f_bo    = _get(bF_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
@@ -2288,12 +2352,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         t_voice = _get(vT_w, w, v_vol_col_T, 0.0) if v_vol_col_T else 0.0
         t_bo    = _get(bT_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
 
+        # settings overrides for volume (and aht/sut for forecast calc)
         if w in voice_ovr["vol_w"]:
             f_voice = voice_ovr["vol_w"][w]
         if w in bo_ovr["vol_w"]:
             f_bo = bo_ovr["vol_w"][w]
-        
-        # Use overridden AHT/SUT in the forecast weighting when available
+
         ovr_aht_voice = voice_ovr["aht_or_sut_w"].get(w, None)
         ovr_sut_bo    = bo_ovr["aht_or_sut_w"].get(w, None)
 
@@ -2317,7 +2381,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         if "Actual AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Actual AHT/SUT", w] = actual_aht_sut
 
-       # --- Weighted Forecast AHT/SUT (override-aware) ---
+        # --- Weighted Forecast AHT/SUT (override-aware) ---
         f_num = f_den = 0.0
         # voice contribution
         if ovr_aht_voice is not None and f_voice > 0:
@@ -2326,7 +2390,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         elif v_aht_col_F:
             f_num += _get(vF_w, w, v_aht_col_F, 0.0) * _get(vF_w, w, v_vol_col_F, 0.0)
             f_den += _get(vF_w, w, v_vol_col_F, 0.0)
-        
         # back-office contribution
         if ovr_sut_bo is not None and f_bo > 0:
             f_num += ovr_sut_bo * f_bo
@@ -2334,39 +2397,40 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         elif b_sut_col_F:
             f_num += _get(bF_w, w, b_sut_col_F, 0.0) * _get(bF_w, w, b_itm_col,   0.0)
             f_den += _get(bF_w, w, b_itm_col,   0.0)
-        
+
         forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
         forecast_aht_sut = _first_positive(forecast_aht_sut, s_target_aht, default=s_target_aht)
         wk_aht_sut_forecast[w] = forecast_aht_sut
         denom = float(f_voice + f_bo)
 
-        # if no forecast volume at all this week, fall back to a sensible scalar
+        # --- Budgeted AHT/SUT row (Option A: weekly Budget upload → weighted by current volumes) ---
         if "Budgeted AHT/SUT" in fw_rows:
+            bud_voice = budget_voice_w.get(w, None)
+            bud_bo    = budget_bo_w.get(w, None)
+            voice_budget = bud_voice if (bud_voice is not None and bud_voice > 0) else s_budget_aht
+            bo_budget    = bud_bo    if (bud_bo    is not None and bud_bo    > 0) else s_budget_sut
             if denom > 0:
-                bud_val = ((f_voice * s_budget_aht) + (f_bo * s_budget_sut)) / denom
+                bud_val = ((f_voice * voice_budget) + (f_bo * bo_budget)) / denom
             else:
-                # fallback: prefer voice budget AHT, else BO budget SUT
-                bud_val = _first_positive(s_budget_aht, s_budget_sut, default=s_budget_aht)
+                bud_val = _first_positive(voice_budget, bo_budget, default=s_budget_aht)
             fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = float(bud_val)
 
         if "Target AHT/SUT" in fw_rows:
             if denom > 0:
                 tgt_val = ((f_voice * s_target_aht) + (f_bo * s_target_sut)) / denom
             else:
-                # fallback: prefer voice target AHT, else BO target SUT
                 tgt_val = _first_positive(s_target_aht, s_target_sut, default=s_target_aht)
             fw.loc[fw["metric"] == "Target AHT/SUT", w] = float(tgt_val)
         if "Forecast AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Forecast AHT/SUT", w] = forecast_aht_sut
-        
+
         # also ensure the "Forecast" row uses the possibly overridden volumes
         if "Forecast" in fw_rows:
             fw.loc[fw["metric"]=="Forecast", w] = f_voice + f_bo
-        
+
         # demand used for SL should see the overrides too
         weekly_demand_voice[w] = f_voice if f_voice > 0 else (a_voice if a_voice > 0 else t_voice)
         weekly_demand_bo[w]    = f_bo    if f_bo    > 0 else (a_bo    if a_bo    > 0 else t_bo)
-
 
     # Occupancy value (and fraction for capacity)
     if "Occupancy" in fw_rows:
@@ -2404,9 +2468,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
     req_daily_actual   = required_fte_daily(use_voice_for_req, use_bo_for_req, pd.DataFrame(), settings)
     req_daily_forecast = required_fte_daily(vF, bF, pd.DataFrame(), settings)
     req_daily_tactical = required_fte_daily(vT, bT, pd.DataFrame(), settings) if (isinstance(vT, pd.DataFrame) and not vT.empty) or (isinstance(bT, pd.DataFrame) and not bT.empty) else pd.DataFrame()
-    vB = vF.copy(); bB = bF.copy()
+
+    # Budgeted path (Option A): start with static, then overlay weekly budget uploads
+    vB = vF.copy() if isinstance(vF, pd.DataFrame) else vF
+    bB = bF.copy() if isinstance(bF, pd.DataFrame) else bF
     if isinstance(vB, pd.DataFrame) and not vB.empty: vB["aht_sec"] = float(s_budget_aht)
     if isinstance(bB, pd.DataFrame) and not bB.empty: bB["aht_sec"] = float(s_budget_sut)
+    vB = _apply_weekly_override(vB, budget_voice_w, "aht_sec") if isinstance(vB, pd.DataFrame) else vB
+    bB = _apply_weekly_override(bB, budget_bo_w,    "aht_sec") if isinstance(bB, pd.DataFrame) else bB
+
     req_daily_budgeted = required_fte_daily(vB, bB, pd.DataFrame(), settings)
 
     def _daily_to_weekly(df):
