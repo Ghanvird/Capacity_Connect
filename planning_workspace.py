@@ -8,8 +8,7 @@ import dash_bootstrap_components as dbc
 from dash import Input, Output, State, dcc, html, no_update
 from dash.dependencies import ALL
 from dash.exceptions import PreventUpdate
-
-
+import pandas as pd
 
 try:
     from dash import ctx
@@ -17,7 +16,7 @@ except Exception:
     from dash import callback_context as ctx
 
 # ---------- Data access ----------
-from cap_store import _conn, load_mapping_sheet1, load_mapping_sheet2
+from cap_store import _conn, load_mapping_sheet1, get_roster_locations
 from plan_store import create_plan, delete_plan, list_business_areas, list_plans, get_plan
 
 ADMIN_MODE = os.getenv("ADMIN_MODE", "1") in ("1", "true", "yes", "on")
@@ -25,7 +24,7 @@ ADMIN_DELETE_ENABLED = False  # keep off by default
 
 # ---------- Constants ----------
 ALPHABET = ["All"] + list(string.ascii_uppercase)
-CHANNEL_OPTIONS = ["Voice", "Backoffice", "Chat", "MessageUs", "Outbound", "Blended"]
+CHANNEL_OPTIONS = ["Voice", "Back Office", "Chat", "MessageUs", "Outbound", "Blended"]
 PLAN_TYPE_OPTIONS = [
     "Volume Based",
     "Billable Hours Based",
@@ -64,6 +63,133 @@ CHAN_ALIASES = {
     "omni": "Omni",
 }
 
+# ========= Headcount-backed helpers =========
+
+def _headcount_sites_for_ba_loc(ba: str, location: str | None) -> List[str]:
+    """
+    Sites for a BA filtered by selected location.
+    Location matches either Country or City (case-insensitive).
+    """
+    if not ba:
+        return []
+    try:
+        with _conn() as cx:
+            params = [ba]
+            where = "journey = ?"
+            if location:
+                where += """
+                    AND (
+                        LOWER(COALESCE(position_location_country,'')) = LOWER(?)
+                        OR LOWER(COALESCE(position_location_city,'')) = LOWER(?)
+                    )
+                """
+                params += [location, location]
+            rows = cx.execute(f"""
+                SELECT DISTINCT position_location_building_description AS site
+                FROM headcount
+                WHERE {where}
+                  AND position_location_building_description IS NOT NULL
+                  AND TRIM(position_location_building_description) <> ''
+                ORDER BY LOWER(position_location_building_description)
+            """, params).fetchall()
+        return [r["site"] for r in rows]
+    except Exception:
+        return []
+
+
+def _headcount_bas() -> List[str]:
+    """Business Areas from Headcount Update: Journey (distinct, non-empty)."""
+    try:
+        with _conn() as cx:
+            rows = cx.execute("""
+                SELECT DISTINCT journey
+                FROM headcount
+                WHERE journey IS NOT NULL AND TRIM(journey) <> ''
+                ORDER BY LOWER(journey)
+            """).fetchall()
+        return [r["journey"] for r in rows]
+    except Exception:
+        return []
+
+def _headcount_sbas_for_ba(ba: str) -> List[str]:
+    """Sub Business Area for a BA = Level 3 in Headcount (filtered by Journey)."""
+    if not ba:
+        return []
+    try:
+        with _conn() as cx:
+            rows = cx.execute("""
+                SELECT DISTINCT level_3 AS sba
+                FROM headcount
+                WHERE journey = ?
+                  AND level_3 IS NOT NULL
+                  AND TRIM(level_3) <> ''
+                ORDER BY LOWER(level_3)
+            """, (ba,)).fetchall()
+        return [r["sba"] for r in rows]
+    except Exception:
+        return []
+
+def _headcount_sites_for_ba(ba: str) -> List[str]:
+    """Sites for BA from Headcount: Position Location Building Description (distinct, non-empty)."""
+    if not ba:
+        return []
+    try:
+        with _conn() as cx:
+            rows = cx.execute("""
+                SELECT DISTINCT position_location_building_description AS site
+                FROM headcount
+                WHERE journey = ?
+                  AND position_location_building_description IS NOT NULL
+                  AND TRIM(position_location_building_description) <> ''
+                ORDER BY LOWER(position_location_building_description)
+            """, (ba,)).fetchall()
+        return [r["site"] for r in rows]
+    except Exception:
+        return []
+
+def _headcount_locations_for_ba(ba: str) -> List[str]:
+    """Locations for BA from Headcount: prefer Country; else fallback to City."""
+    if not ba:
+        return []
+    try:
+        with _conn() as cx:
+            countries = cx.execute("""
+                SELECT DISTINCT position_location_country AS loc
+                FROM headcount
+                WHERE journey = ?
+                  AND position_location_country IS NOT NULL
+                  AND TRIM(position_location_country) <> ''
+                ORDER BY LOWER(position_location_country)
+            """, (ba,)).fetchall()
+            if countries:
+                return [r["loc"] for r in countries]
+
+            cities = cx.execute("""
+                SELECT DISTINCT position_location_city AS loc
+                FROM headcount
+                WHERE journey = ?
+                  AND position_location_city IS NOT NULL
+                  AND TRIM(position_location_city) <> ''
+                ORDER BY LOWER(position_location_city)
+            """, (ba,)).fetchall()
+            return [r["loc"] for r in cities]
+    except Exception:
+        return []
+
+# ========= Existing helpers (kept) =========
+
+def _collect_site_options() -> list[dict]:
+    """Legacy union of sites from roster & Mapping Sheet 1; not used in new modal flow."""
+    sites: set[str] = set(get_roster_locations() or [])
+    m1 = load_mapping_sheet1()
+    if isinstance(m1, pd.DataFrame) and not m1.empty:
+        for col in ["Site", "site", "Location", "location"]:
+            if col in m1.columns:
+                vals = (
+                    m1[col].dropna().astype(str).str.strip().replace({"": pd.NA}).dropna().tolist()
+                )
+                sites.update(vals)
+    return [{"label": s, "value": s} for s in sorted(sites)]
 
 def _canonical_channel(label: str | None) -> str:
     if not label:
@@ -71,13 +197,11 @@ def _canonical_channel(label: str | None) -> str:
     s = label.strip().lower()
     return CHAN_ALIASES.get(s, label.strip().title())
 
-
 def _chan_icon(label: str | None) -> str:
     c = _canonical_channel(label or "")
     return CHANNEL_ICON.get(c, "👥")
 
-
-# ---------- Helpers ----------
+# ---------- UI bits ----------
 def _ba_chip_card(ba: str) -> dbc.Card:
     return dbc.Card(
         dbc.CardBody(
@@ -89,65 +213,29 @@ def _ba_chip_card(ba: str) -> dbc.Card:
         className="ws-ba-card",
     )
 
-
-def _sbas_from_map1(ba: str) -> List[str]:
-    if not ba:
-        return []
-    df = load_mapping_sheet1()
-    if df is None or df.empty:
-        return []
-    cols = {str(c).lower(): c for c in df.columns}
-    ba_col = cols.get("business area") or list(df.columns)[0]
-    sba_col = cols.get("sub business area") or list(df.columns)[1]
-    try:
-        dff = df[[ba_col, sba_col]].dropna()
-        dff = dff[dff[ba_col].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
-        sbas = (
-            dff[sba_col].astype(str).str.strip().replace({"": None}).dropna().drop_duplicates().sort_values().tolist()
-        )
-        return sbas
-    except Exception:
-        return []
-
-
-def _bas_from_mapping_sheet2() -> List[str]:
-    df = load_mapping_sheet2()
-    if df is None or df.empty:
-        return []
-    cols = {str(c).lower(): c for c in df.columns}
-    cand = (
-        cols.get("business area nomenclature")
-        or cols.get("ba nomenclature")
-        or cols.get("business area")
-        or list(df.columns)[-1]
-    )
-    try:
-        vals = df[cand].dropna().astype(str).str.strip()
-        vals = vals[vals != ""].unique().tolist()
-    except Exception:
-        vals = []
-    return sorted(vals)
-
-
 def _ba_union_for_dropdown(status_filter: str) -> List[dict]:
+    """
+    Business Area options = union of:
+    - BAs that already have plans (Current/History)
+    - Headcount Update 'Journey' values
+    """
     from_plans = set(list_business_areas(status_filter) or [])
-    from_map2 = set(_bas_from_mapping_sheet2() or [])
-    union = sorted(from_plans | from_map2)
+    from_headcount = set(_headcount_bas() or [])
+    union = sorted(from_plans | from_headcount)
     return [{"label": b, "value": b} for b in union]
 
-
 def _sbas_for_ba(ba: str, plans: list[dict]) -> list[str]:
-    try:
-        sbas_m1 = _sbas_from_map1(ba) or []
-    except Exception:
-        sbas_m1 = []
-    seen: list[str] = []
+    """
+    Column order for Kanban = Headcount SBAs (Level 3) + any SBAs seen in plans.
+    """
+    hc_sbas = _headcount_sbas_for_ba(ba) or []
+    seen_in_plans: list[str] = []
     for r in plans or []:
         s = (r.get("sub_ba") or "").strip()
-        if s and s not in seen:
-            seen.append(s)
-    return (sbas_m1 + [s for s in seen if s not in sbas_m1]) or ["Overall"]
-
+        if s and s not in seen_in_plans:
+            seen_in_plans.append(s)
+    out = hc_sbas + [s for s in seen_in_plans if s not in hc_sbas]
+    return out or ["Overall"]
 
 def _group_plans_by_sba_and_channel(plans: list[dict]) -> dict:
     out: dict[str, dict] = {}
@@ -163,7 +251,6 @@ def _group_plans_by_sba_and_channel(plans: list[dict]) -> dict:
             loc = (r.get("location") or "").strip()
             node["site_pairs"].add((site, loc))
     return out
-
 
 def _kanban_column(sba: str, data_for_sba: dict) -> html.Div:
     ch_keys = sorted(data_for_sba.keys()) if data_for_sba else []
@@ -238,7 +325,6 @@ def _kanban_column(sba: str, data_for_sba: dict) -> html.Div:
         cards.append(html.Div("No plans yet", className="text-muted small ws-card-empty"))
     return html.Div([html.Div(sba or "Overall", className="ws-col-head"), html.Div(cards, className="ws-col-body")], className="ws-kanban-col")
 
-
 def _render_ba_detail(ba: str, status_filter: str) -> dbc.Card:
     plans = list_plans(vertical=ba, status_filter=status_filter) or []
     order = _sbas_for_ba(ba, plans)
@@ -250,73 +336,6 @@ def _render_ba_detail(ba: str, status_filter: str) -> dbc.Card:
         dbc.CardBody(html.Div([html.Div(cols, className="ws-kanban")], className="d-flex flex-column gap-2")),
         className="ws-right-card",
     )
-
-
-def _sites_locations_for_ba(ba: str) -> Tuple[list[str], list[str]]:
-    locs, sites = set(DEFAULT_LOCATIONS), set()
-    with _conn() as cx:
-        row = cx.execute("SELECT hierarchy_json FROM clients WHERE business_area=?", (ba,)).fetchone()
-        if row:
-            try:
-                h = json.loads(row["hierarchy_json"] or "{}")
-                locs.update(h.get("locations") or [])
-                sites.update(h.get("sites") or [])
-            except Exception:
-                pass
-    return sorted(locs), sorted(sites)
-
-
-def _upsert_client_hierarchy(
-    ba: str,
-    sub_ba: str | None,
-    channels: Iterable[str] | None,
-    location: str | None,
-    site: str | None,
-    week_start: str | None,
-):
-    channels = list(channels or [])
-    with _conn() as cx:
-        row = cx.execute("SELECT hierarchy_json FROM clients WHERE business_area=?", (ba,)).fetchone()
-        if row:
-            try:
-                h = json.loads(row["hierarchy_json"] or "{}")
-            except Exception:
-                h = {}
-        else:
-            h = {}
-
-        subs = set(h.get("sub_business_areas") or [])
-        if sub_ba:
-            subs.add(sub_ba)
-        chs = set(h.get("channels") or [])
-        chs.update(channels)
-        locs = set(h.get("locations") or [])
-        if location:
-            locs.add(location)
-        sites = set(h.get("sites") or [])
-        if site:
-            sites.add(site)
-        if week_start:
-            h["week_start"] = week_start
-
-        h["sub_business_areas"] = sorted(list(subs)) or ["Default"]
-        h["channels"] = sorted(list(chs)) or CHANNEL_OPTIONS
-        if locs:
-            h["locations"] = sorted(list(locs))
-        if sites:
-            h["sites"] = sorted(list(sites))
-
-        blob = json.dumps(h)
-        cx.execute(
-            """
-            INSERT INTO clients(business_area, hierarchy_json)
-            VALUES(?,?)
-            ON CONFLICT(business_area) DO UPDATE SET hierarchy_json=excluded.hierarchy_json
-            """,
-            (ba, blob),
-        )
-        cx.commit()
-
 
 # ---------- Layout ----------
 def planning_layout():
@@ -418,7 +437,7 @@ def planning_layout():
                     ),
                 ]
             ),
-            # Modal: New Cap Plan
+            # Modal: New Cap Plan (no Setup New Site link anymore)
             dbc.Modal(
                 [
                     dbc.ModalHeader(dbc.ModalTitle("Add New Plan"), className="ws-modal-header"),
@@ -432,10 +451,6 @@ def planning_layout():
                                         [
                                             dbc.Label("Verticals (Business Area)"),
                                             dcc.Dropdown(id="vertical"),
-                                            html.Div(
-                                                dbc.Button("↗ Setup New Business Area", id="btn-setup-ba", color="link", className="p-0 mt-1"),
-                                                className="small text-primary",
-                                            ),
                                         ],
                                         md=3,
                                     ),
@@ -472,37 +487,7 @@ def planning_layout():
                 is_open=False,
                 size="xl",
             ),
-            # Modal: Setup New Business Area
-            dbc.Modal(
-                [
-                    dbc.ModalHeader(dbc.ModalTitle("Setup New Business Area"), className="ws-modal-header"),
-                    dbc.ModalBody(
-                        [
-                            dbc.Row(
-                                [
-                                    dbc.Col([dbc.Label("Business Area"), dcc.Dropdown(id="ba-m2")], md=4),
-                                    dbc.Col([dbc.Label("Sub Business Area"), dcc.Dropdown(id="sba-new", clearable=True)], md=4),
-                                    dbc.Col([dbc.Label("Channels"), dcc.Dropdown(id="ch-new", multi=True, options=[{"label": x, "value": x} for x in CHANNEL_OPTIONS])], md=4),
-                                ],
-                                className="mb-2 g-2",
-                            ),
-                            dbc.Row(
-                                [
-                                    dbc.Col([dbc.Label("Location"), dcc.Dropdown(id="loc-new", options=[{"label": v, "value": v} for v in DEFAULT_LOCATIONS])], md=4),
-                                    dbc.Col([dbc.Label("Site"), dbc.Input(id="site-new")], md=4),
-                                    dbc.Col([dbc.Label("Week Start Day"), dcc.Dropdown(id="wkstart-new", value="Monday", options=[{"label": d, "value": d} for d in WEEK_DAYS])], md=4),
-                                ],
-                                className="mb-2 g-2",
-                            ),
-                            html.Div(id="ba-setup-msg", className="text-danger mt-1"),
-                        ]
-                    ),
-                    dbc.ModalFooter([dbc.Button("Save Business Area", id="btn-save-ba", color="primary"), dbc.Button("Close", id="btn-close-ba", className="ms-2")]),
-                ],
-                id="modal-setup-ba",
-                is_open=False,
-                size="lg",
-            ),
+            # (Setup New Business Area modal removed)
             # Modal: Confirm delete (DEV only)
             dcc.Store(id="ws-del-pid"),
             dbc.Modal(
@@ -518,7 +503,6 @@ def planning_layout():
         ],
         fluid=True,
     )
-
 
 # ---------- Shared rendering (DRY) ----------
 def _render_left_and_right(
@@ -540,7 +524,6 @@ def _render_left_and_right(
         return left_list, right, chosen
     left_list = html.Div("No Business Areas found.", className="text-muted small")
     return left_list, html.Div(), None
-
 
 # ---------- Callbacks ----------
 def register_planning_ws(app):
@@ -564,7 +547,7 @@ def register_planning_ws(app):
         State("planning-ready", "data"),
     )
 
-    # 4) Bump ws-refresh AFTER ready (safe; this callback does not exist on Home because its Input is in planning_layout)
+    # Bump ws-refresh AFTER ready
     @app.callback(
         Output("ws-refresh", "data"),
         Input("planning-ready", "data"),
@@ -576,7 +559,7 @@ def register_planning_ws(app):
             raise PreventUpdate
         return int(cur or 0) + 1
 
-    # Breadcrumb — safe on all pages; header always mounted
+    # Breadcrumb
     @app.callback(
         Output("ws-breadcrumb", "items"),
         Input("url-router", "pathname"),
@@ -584,28 +567,7 @@ def register_planning_ws(app):
         Input("ws-selected-ba", "data"),
         prevent_initial_call=False,
     )
-    # def _crumb(pathname, status, selected_ba):
-    #     path = (pathname or "").rstrip("/")
-    #     if path != "/planning":
-    #         return [{"label": "Home", "href": "/", "active": False}]
-    #     items = [
-    #         {"label": "CAP-CONNECT", "href": "/"},
-    #         {"label": "Planning Workspace", "href": "/planning", "active": selected_ba is None},
-    #     ]
-    #     if selected_ba:
-    #         items.append({"label": f"{selected_ba} ({(status or 'current').title()})", "active": True})
-    #     return items
     def _crumb(pathname, status, selected_ba):
-        """
-        Rules:
-        - On Home ("/"): show a single clickable "Home" item.
-        - On Planning Workspace ("/planning"):
-            CAP-CONNECT / Planning Workspace  [or]
-            CAP-CONNECT / Planning Workspace / <BA (Current|History)>
-        - On Plan Detail ("/plan/<id>"):
-            CAP-CONNECT / Planning Workspace / <BA> / <Plan Name>
-        - On any other page: show a single clickable "Home".
-        """
         path = (pathname or "").rstrip("/")
 
         # Plan detail
@@ -632,14 +594,28 @@ def register_planning_ws(app):
                 {"label": "Planning Workspace", "href": "/planning", "active": selected_ba is None},
             ]
             if selected_ba:
-                items.append({
-                    "label": f"{selected_ba} ({(status or 'current').title()})",
-                    "active": True
-                })
+                items.append({"label": f"{selected_ba} ({(status or 'current').title()})", "active": True})
             return items
 
-        # Home (and everything else → just show a clickable Home that always works)
+        # Home / others
         return [{"label": "Home", "href": "/", "active": False}]
+    
+    # Open/close the New Plan modal (no pathname gating)
+    @app.callback(
+        Output("modal-newplan", "is_open", allow_duplicate=True),
+        Input("btn-new-plan", "n_clicks"),
+        Input("btn-cancel", "n_clicks"),
+        State("modal-newplan", "is_open"),
+        prevent_initial_call=True,
+    )
+    def _toggle_newplan(n_open, n_cancel, is_open):
+        trig = getattr(ctx, "triggered_id", None)
+        if trig == "btn-new-plan":
+            return True
+        if trig == "btn-cancel":
+            return False
+        return is_open
+
 
     # Tabs
     @app.callback(
@@ -672,12 +648,11 @@ def register_planning_ws(app):
             raise PreventUpdate
         return "Current" if (status or "current") == "current" else "History"
 
-    # ===== A) Planning-local triggers: alpha/search → render list & panel
+    # ===== A) Alpha/search → render list & panel + BA dropdown options
     @app.callback(
         Output("ba-list", "children"),
         Output("ba-detail-col", "children"),
         Output("vertical", "options"),
-        Output("ba-m2", "options"),
         Output("ws-selected-ba", "data"),
         Input("alpha-filter", "value"),
         Input("search-ba", "value"),
@@ -699,29 +674,25 @@ def register_planning_ws(app):
 
         left_list, right, chosen = _render_left_and_right(bas_left, status_filter, selected_ba)
         opts_union = _ba_union_for_dropdown(status_filter)
-        map2_opts = [{"label": b, "value": b} for b in (_bas_from_mapping_sheet2() or [])]
-        return left_list, right, opts_union, map2_opts, chosen
+        return left_list, right, opts_union, chosen
 
-    # --- 5) Keep the global renderer duplicate-safe (unchanged if you already fixed it) ---
+    # Global renderer duplicate-safe (refresh)
     @app.callback(
         Output("ba-list", "children", allow_duplicate=True),
         Output("ba-detail-col", "children", allow_duplicate=True),
         Output("vertical", "options", allow_duplicate=True),
-        Output("ba-m2", "options", allow_duplicate=True),
         Output("ws-selected-ba", "data", allow_duplicate=True),
         Input("ws-status", "data"),
         Input("ws-refresh", "data"),
         State("ws-selected-ba", "data"),
-        prevent_initial_call=True,  # <-- important with allow_duplicate
+        prevent_initial_call=True,
     )
     def _fill_on_refresh(status_filter, _refresh, selected_ba):
         status_filter = (status_filter or "current")
         bas_left = sorted(set(list_business_areas(status_filter) or []))
         left_list, right, chosen = _render_left_and_right(bas_left, status_filter, selected_ba)
         opts_union = _ba_union_for_dropdown(status_filter)
-        map2_opts = [{"label": b, "value": b} for b in (_bas_from_mapping_sheet2() or [])]
-        return left_list, right, opts_union, map2_opts, chosen
-
+        return left_list, right, opts_union, chosen
 
     # BA click → set selected + update right pane
     @app.callback(
@@ -765,7 +736,7 @@ def register_planning_ws(app):
             return selected_ba
         raise PreventUpdate
 
-    # Sub BA options
+    # Sub BA options (from Headcount Level 3)
     @app.callback(
         Output("subba", "options"),
         Output("subba", "value"),
@@ -778,33 +749,14 @@ def register_planning_ws(app):
             raise PreventUpdate
         if not ba:
             return [], None
-        sbas = _sbas_from_map1(ba)
+        sbas = _headcount_sbas_for_ba(ba)
         if not sbas:
             return [], None
         opts = [{"label": s, "value": s} for s in sbas]
         return opts, (sbas[0] if sbas else None)
 
-    # SBA in Setup BA modal
-    @app.callback(
-        Output("sba-new", "options"),
-        Output("sba-new", "value"),
-        Input("ba-m2", "value"),
-        Input("modal-setup-ba", "is_open"),
-        State("url-router", "pathname"),
-        prevent_initial_call=False,
-    )
-    def _fill_sba_new(ba, is_open, pathname):
-        if (pathname or "").rstrip("/") != "/planning":
-            raise PreventUpdate
-        if not ba:
-            return [], None
-        sbas = _sbas_from_map1(ba)
-        if not sbas:
-            return [], None
-        opts = [{"label": s, "value": s} for s in sbas]
-        return opts, sbas[0]
-
-    # Location & Site in Add New Plan
+    # Location & Site in Add New Plan (from Headcount; Site depends on BA)
+# (A) When BA changes: set Location options/value and prime Site by the first Location
     @app.callback(
         Output("location", "options"),
         Output("location", "value"),
@@ -814,43 +766,46 @@ def register_planning_ws(app):
         State("url-router", "pathname"),
         prevent_initial_call=False,
     )
-    def _fill_loc_site(ba, pathname):
+    def _prime_loc_site_on_ba(ba, pathname):
         if (pathname or "").rstrip("/") != "/planning":
             raise PreventUpdate
         if not ba:
             return [{"label": v, "value": v} for v in DEFAULT_LOCATIONS], None, [], None
-        locs, sites = _sites_locations_for_ba(ba)
+
+        locs = _headcount_locations_for_ba(ba) or DEFAULT_LOCATIONS
+        loc_val = (locs[0] if locs else None)
+
+        sites = _headcount_sites_for_ba_loc(ba, loc_val) or []
+        site_val = (sites[0] if sites else None)
+
         loc_opts = [{"label": v, "value": v} for v in locs]
         site_opts = [{"label": s, "value": s} for s in sites]
-        loc_val = (locs[0] if locs else None)
-        site_val = (sites[0] if sites else None)
         return loc_opts, loc_val, site_opts, site_val
 
-    # Save new BA
+
+    # (B) When Location changes: update Site options/value for the selected BA
     @app.callback(
-        Output("ba-setup-msg", "children"),
-        Output("ws-refresh", "data", allow_duplicate=True),
-        Input("btn-save-ba", "n_clicks"),
-        State("ba-m2", "value"),
-        State("sba-new", "value"),
-        State("ch-new", "value"),
-        State("loc-new", "value"),
-        State("site-new", "value"),
-        State("wkstart-new", "value"),
-        State("ws-refresh", "data"),
+        Output("site", "options", allow_duplicate=True),
+        Output("site", "value", allow_duplicate=True),
+        Input("location", "value"),
+        State("vertical", "value"),
+        State("site", "value"),
         State("url-router", "pathname"),
         prevent_initial_call=True,
     )
-    def _save_ba(n, ba, sba, chs, loc, site, wkstart, refresh_counter, pathname):
+    def _update_site_on_location(location, ba, current_site, pathname):
         if (pathname or "").rstrip("/") != "/planning":
             raise PreventUpdate
-        if not ba:
-            return "Pick a Business Area.", no_update
-        try:
-            _upsert_client_hierarchy(ba, sba, chs, loc, site, wkstart or "Monday")
-        except Exception as e:
-            return f"Error: {e}", no_update
-        return "Saved ✓", int(refresh_counter or 0) + 1
+        if not ba or not location:
+            return [], None
+
+        sites = _headcount_sites_for_ba_loc(ba, location) or []
+        site_opts = [{"label": s, "value": s} for s in sites]
+
+        # keep current site if still valid; else pick first
+        site_val = current_site if (current_site in sites) else (sites[0] if sites else None)
+        return site_opts, site_val
+
 
     # Create plan
     @app.callback(
@@ -971,38 +926,7 @@ def register_planning_ws(app):
             return False, no_update, no_update
         raise PreventUpdate
 
-    # ---------- Modal open/close (Add New Plan  ↔  Setup BA) ----------
-    @app.callback(
-        Output("modal-newplan", "is_open", allow_duplicate=True),
-        Output("modal-setup-ba", "is_open"),
-        Input("btn-new-plan", "n_clicks"),  # open New Plan
-        Input("btn-cancel", "n_clicks"),  # close New Plan
-        Input("btn-setup-ba", "n_clicks"),  # open Setup BA from New Plan
-        Input("btn-close-ba", "n_clicks"),  # close Setup BA
-        Input("btn-save-ba", "n_clicks"),  # save + close Setup BA -> reopen New Plan
-        State("modal-newplan", "is_open"),
-        State("modal-setup-ba", "is_open"),
-        State("url-router", "pathname"),
-        prevent_initial_call=True,
-    )
-    def _toggle_modals(n_new, n_cancel, n_setup, n_close_ba, n_save_ba, is_new_open, is_ba_open, pathname):
-        if (pathname or "").rstrip("/") != "/planning":
-            raise PreventUpdate
-        trig = (ctx.triggered[0]["prop_id"].split(".")[0] if getattr(ctx, "triggered", None) else "")
-        if trig == "btn-new-plan":
-            return True, False
-        if trig == "btn-cancel":
-            return False, False
-        if trig == "btn-setup-ba":
-            return False, True
-        if trig in ("btn-close-ba", "btn-save-ba"):
-            # after closing/saving Setup BA, return to New Plan modal
-            return True, False
-        # default: no change
-        return is_new_open, is_ba_open
-
     # Kanban horizontal scroll (arrows)
-# --- 6) Optional hardening: gate the Kanban arrow clientside callback on pathname ---
     app.clientside_callback(
         """
         function(nL, nR, pathname) {
@@ -1019,7 +943,7 @@ def register_planning_ws(app):
         if (!dir) { return null; }
 
         const tile = el.querySelector('.ws-kanban-col');
-        const step = tile ? (tile.getBoundingClientRect().width + 16) : 420; // why: feel natural
+        const step = tile ? (tile.getBoundingClientRect().width + 16) : 420;
         el.scrollBy({ left: dir * step, behavior: 'smooth' });
         return Date.now();
         }
@@ -1029,3 +953,10 @@ def register_planning_ws(app):
         Input("kanban-right", "n_clicks"),
         Input("url-router", "pathname"),
     )
+
+    # (legacy helper kept; not wired)
+    def _refresh_site_options(path, open_clicks, map1_saved):
+        path = (path or "").rstrip("/")
+        if path and (path != "/planning"):
+            raise PreventUpdate
+        return _collect_site_options()
