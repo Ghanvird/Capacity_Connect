@@ -2286,6 +2286,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         t_voice = _get(vT_w, w, v_vol_col_T, 0.0) if v_vol_col_T else 0.0
         t_bo    = _get(bT_w, w, b_itm_col,   0.0) if b_itm_col   else 0.0
 
+        if w in voice_ovr["vol_w"]:
+            f_voice = voice_ovr["vol_w"][w]
+        if w in bo_ovr["vol_w"]:
+            f_bo = bo_ovr["vol_w"][w]
+        
+        # Use overridden AHT/SUT in the forecast weighting when available
+        ovr_aht_voice = voice_ovr["aht_or_sut_w"].get(w, None)
+        ovr_sut_bo    = bo_ovr["aht_or_sut_w"].get(w, None)
+
         weekly_demand_voice[w] = (f_voice if f_voice > 0 else (a_voice if a_voice > 0 else t_voice))
         weekly_demand_bo[w]    = (f_bo    if f_bo    > 0 else (a_bo    if a_bo    > 0 else t_bo))
 
@@ -2306,21 +2315,38 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         if "Actual AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Actual AHT/SUT", w] = actual_aht_sut
 
-        # Weighted Forecast AHT/SUT
+       # --- Weighted Forecast AHT/SUT (override-aware) ---
         f_num = f_den = 0.0
-        if v_aht_col_F: f_num += _get(vF_w, w, v_aht_col_F, 0.0) * _get(vF_w, w, v_vol_col_F, 0.0); f_den += _get(vF_w, w, v_vol_col_F, 0.0)
-        if b_sut_col_F: f_num += _get(bF_w, w, b_sut_col_F, 0.0) * _get(bF_w, w, b_itm_col,   0.0); f_den += _get(bF_w, w, b_itm_col,   0.0)
+        # voice contribution
+        if ovr_aht_voice is not None and f_voice > 0:
+            f_num += ovr_aht_voice * f_voice
+            f_den += f_voice
+        elif v_aht_col_F:
+            f_num += _get(vF_w, w, v_aht_col_F, 0.0) * _get(vF_w, w, v_vol_col_F, 0.0)
+            f_den += _get(vF_w, w, v_vol_col_F, 0.0)
+        
+        # back-office contribution
+        if ovr_sut_bo is not None and f_bo > 0:
+            f_num += ovr_sut_bo * f_bo
+            f_den += f_bo
+        elif b_sut_col_F:
+            f_num += _get(bF_w, w, b_sut_col_F, 0.0) * _get(bF_w, w, b_itm_col,   0.0)
+            f_den += _get(bF_w, w, b_itm_col,   0.0)
+        
         forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
         forecast_aht_sut = _first_positive(forecast_aht_sut, s_target_aht, default=s_target_aht)
         wk_aht_sut_forecast[w] = forecast_aht_sut
         if "Forecast AHT/SUT" in fw_rows:
             fw.loc[fw["metric"]=="Forecast AHT/SUT", w] = forecast_aht_sut
+        
+        # also ensure the "Forecast" row uses the possibly overridden volumes
+        if "Forecast" in fw_rows:
+            fw.loc[fw["metric"]=="Forecast", w] = f_voice + f_bo
+        
+        # demand used for SL should see the overrides too
+        weekly_demand_voice[w] = f_voice if f_voice > 0 else (a_voice if a_voice > 0 else t_voice)
+        weekly_demand_bo[w]    = f_bo    if f_bo    > 0 else (a_bo    if a_bo    > 0 else t_bo)
 
-        denom = (f_voice + f_bo)
-        if "Budgeted AHT/SUT" in fw_rows:
-            fw.loc[fw["metric"]=="Budgeted AHT/SUT", w] = ((f_voice*s_budget_aht)+(f_bo*s_budget_sut))/denom if denom>0 else 0.0
-        if "Target AHT/SUT" in fw_rows:
-            fw.loc[fw["metric"]=="Target AHT/SUT", w] = ((f_voice*s_target_aht)+(f_bo*s_target_sut))/denom if denom>0 else 0.0
 
     # Occupancy value (and fraction for capacity)
     if "Occupancy" in fw_rows:
@@ -2918,5 +2944,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick):
         bulk_df.to_dict("records"),
         notes_df.to_dict("records"),
     )
+
 
 
