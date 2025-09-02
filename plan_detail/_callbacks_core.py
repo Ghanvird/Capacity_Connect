@@ -706,73 +706,18 @@ def register_plan_detail_core(app: dash.Dash):
             State("fw-backlog-carryover", "value"),  # backlog toggle
             prevent_initial_call=True,
         )
-        def _fill_tables(ptype, pid, fw_cols, _tick, grain, whatif, backlog_toggle):   # <-- ADD param
+        def _fill_tables(ptype, pid, fw_cols, _tick, grain, whatif, backlog_toggle):
             w = dict(whatif or {})
             try:
                 w["backlog_carryover"] = bool(backlog_toggle)
             except Exception:
                 pass
-            results = _fill_tables_fixed(ptype, pid, fw_cols, _tick, w, grain=grain or 'week')  # <-- pass
 
-            # If monthly grain requested, aggregate weekly tables to monthly ids
-            if str(grain or 'week').lower() == 'month':
-                import pandas as _pd
-                def _to_month_ids(cols):
-                    mids = []
-                    for c in cols:
-                        try:
-                            t = _pd.to_datetime(c)
-                            m = _pd.Timestamp(t).to_period('M').to_timestamp().date().isoformat()
-                        except Exception:
-                            m = None
-                        mids.append(m)
-                    return mids
-                def _agg(df, month_ids):
-                    if not isinstance(df, _pd.DataFrame) or df.empty:
-                        return df
-                    wk_cols = [c for c in df.columns if c != 'metric']
-                    wk2m = dict(zip(wk_cols, _to_month_ids(wk_cols)))
-                    def is_pct(name: str) -> bool:
-                        s = str(name).lower()
-                        return ('%' in s) or ('aht/sut' in s) or ('utilization' in s) or ('occupancy' in s)
-                    rows = []
-                    for _, r in df.iterrows():
-                        name = r.get('metric')
-                        sums = {m:0.0 for m in month_ids}
-                        counts = {m:0 for m in month_ids}
-                        for w in wk_cols:
-                            m = wk2m.get(w)
-                            if m not in sums: continue
-                            try:
-                                v = float(_pd.to_numeric(r.get(w), errors='coerce'))
-                            except Exception:
-                                v = 0.0
-                            sums[m] += v
-                            counts[m] += 1
-                        outrow = {'metric': name}
-                        for m in month_ids:
-                            if is_pct(name):
-                                c = max(1, counts.get(m,1))
-                                outrow[m] = sums[m] / c
-                            else:
-                                outrow[m] = sums[m]
-                        rows.append(outrow)
-                    cols = ['metric'] + month_ids
-                    return _pd.DataFrame(rows)[cols]
-
-                # month ids from fw_cols order
-                month_ids = [c.get('id') for c in (fw_cols or []) if c.get('id') != 'metric']
-                upper, fw, hc, att, shr, trn, rat, seat, bva, nh, roster_df, bulk_files_df, notes_df = results
-                fw  = _agg(fw, month_ids)
-                hc  = _agg(hc, month_ids)
-                att = _agg(att, month_ids)
-                shr = _agg(shr, month_ids)
-                trn = _agg(trn, month_ids)
-                rat = _agg(rat, month_ids)
-                seat= _agg(seat, month_ids)
-                bva = _agg(bva, month_ids)
-                nh  = _agg(nh, month_ids)
-                results = (upper, fw, hc, att, shr, trn, rat, seat, bva, nh, roster_df, bulk_files_df, notes_df)
+            g = str(grain or 'week').lower()
+            if g == 'month':
+                results = _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, w)
+            else:
+                results = _fill_tables_fixed(ptype, pid, fw_cols, _tick, w, grain='week')
 
             return (*results, False)
 
@@ -2149,4 +2094,5 @@ def register_plan_detail_core(app: dash.Dash):
             prevent_initial_call=False,
         )
         def _toggle_save_disabled(hydrated):
+
             return not bool(hydrated)
